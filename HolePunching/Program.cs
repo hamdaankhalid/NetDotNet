@@ -97,13 +97,12 @@ internal class HolePunchingStateMachine : IDisposable
       throw new ArgumentOutOfRangeException(nameof(maxRetryCount));
     }
 
-    ConfigurationOptions option = ConfigurationOptions.Parse(registrationServerAddr);
-    option.ConnectRetry = maxRetryCount;
-    option.ConnectTimeout = 5000; // 5 seconds
-    option.SyncTimeout = 5000; // 5 seconds
-    option.KeepAlive = 60; // seconds
-
-    _connectionMultiplexer = ConnectionMultiplexer.Connect(option);
+    ConfigurationOptions options = ConfigurationOptions.Parse(registrationServerAddr);
+    options.ConnectRetry = maxRetryCount;
+    options.ConnectTimeout = 5000; // 5 seconds
+    options.SyncTimeout = 5000; // 5 seconds
+    options.KeepAlive = 60; // seconds
+    _connectionMultiplexer = ConnectionMultiplexer.Connect(options);
 
     _selfId = selfId;
     _maxRetryCount = maxRetryCount;
@@ -193,7 +192,7 @@ internal class HolePunchingStateMachine : IDisposable
           _registrationRetryCount++;
           // Peer info not yet available
           _logger?.LogDebug($"HolePunching: Peer info not yet available, retrying... {_registrationRetryCount}/{_maxRetryCount}");
-          await Task.Delay(500); // Wait and let the next next() invocation retry
+          await Task.Delay(2_000); // Wait and let the next next() invocation retry
           break;
         }
 
