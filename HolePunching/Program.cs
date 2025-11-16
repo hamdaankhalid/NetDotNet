@@ -57,7 +57,8 @@ internal class HolePunchingStateMachine : IAsyncDisposable
     "stun4.l.google.com:19302",
   };
 
-  private readonly static byte[] PUNCH_PACKET = System.Text.Encoding.UTF8.GetBytes("HolePunching: Punch Packet");
+  private readonly static byte[] PUNCH_PACKET = System.Text.Encoding.UTF8.GetBytes("HK HolePunching: Punch Packet");
+  private readonly static byte[] ACK_PACKET = System.Text.Encoding.UTF8.GetBytes("HK HolePunching: Ack Packet");
 
   // Session lifetime for registration with server, after these minutes the server will evict our registration
   // this will not impact active connections but will require re-registration for future connections
@@ -276,6 +277,34 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           // retry sending punch packet by moving one level back on state where we will reget Peer's info and resend punch packet incase the first was not received
           CurrentState = HolePunchingState.RegisteredWithServer;
           _logger?.LogDebug("HolePunching: Did not receive response from peer, retrying...");
+          break;
+        }
+
+        // Keep sending acks back to peer till peer starts sending acks back. Otherwise if we stop sending packets the peer is left waiting while we think connection is established
+        bool ackSyncReceived = false;
+        for (int i = 0; i < maxAttempts; i++)
+        {
+          _udpSocket.SendTo(ACK_PACKET, SocketFlags.None, _peerEndPoint); // start sending acks back to peer, and keep sending acks till user starts sending acks back to us
+          // Poll to see if data is available (increased poll time to 250ms for better timing)
+          if (_udpSocket.Poll(250_000, SelectMode.SelectRead)) // microseconds - 250ms between sends
+          {
+            receiveResult = _udpSocket.ReceiveFrom(_internalBuffer, SocketFlags.None, ref tempEndPoint);
+            _logger?.LogDebug("HolePunching: Received {ByteCount} bytes from peer during ACK phase!", receiveResult); // consider this syn-ack?
+            if (receiveResult > 0 && System.Text.Encoding.UTF8.GetString(_internalBuffer, 0, receiveResult) == "HK HolePunching: Ack Packet")
+            {
+              ackSyncReceived = true;
+              break; // Got response!
+            }
+          }
+        }
+
+        if (!ackSyncReceived)
+        {
+          _sendPunchRetryCount++;
+          // Peer may not have registered yet
+          // retry sending punch packet by moving one level back on state where we will reget Peer's info and resend punch packet incase the first was not received
+          CurrentState = HolePunchingState.RegisteredWithServer;
+          _logger?.LogDebug("HolePunching: Did not receive ACK sync from peer, retrying...");
           break;
         }
 
