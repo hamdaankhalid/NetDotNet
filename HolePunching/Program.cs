@@ -252,23 +252,30 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         int maxAttempts = TIMEOUT_SECS * 4;
         EndPoint tempEndPoint = _peerEndPoint; // only need to do this so I can pass it by ref
         bool connected = false;
+        _udpSocket.ReceiveTimeout = 250;
         for (int i = 0; i < maxAttempts; i++)
         {
-          while (peerCtrs[0] != 1 && peerCtrs[1] != 1)
-          {
-            // send local view of ctrs
-            _udpSocket.SendTo(peerCtrs, SocketFlags.None, _peerEndPoint);
+          // send local view of ctrs
+          _udpSocket.SendTo(peerCtrs, SocketFlags.None, _peerEndPoint);
 
-            // observe incoming ctr updates
-            if (_udpSocket.Poll(250_000, SelectMode.SelectRead)) // microseconds - 250ms between sends
+          // observe incoming ctr updates
+          if (_udpSocket.Poll(250_000, SelectMode.SelectRead)) // microseconds - 250ms between sends
+          {
+            int receiveResult = _udpSocket.ReceiveFrom(readPeerCtrs, SocketFlags.None, ref tempEndPoint);
+            _logger?.LogDebug("HolePunching: Received {ByteCount} bytes from peer!", receiveResult);
+            if (receiveResult > 0)
             {
-              SocketReceiveFromResult receiveResult = await _udpSocket.ReceiveFromAsync(readPeerCtrs, SocketFlags.None, tempEndPoint);
-              _logger?.LogDebug("HolePunching: Received {ByteCount} bytes from peer!", receiveResult.ReceivedBytes);
               // Tell peer 1 that peer 0 has recvd the packet by incrementing peerCtrs[1]
               peerCtrs[1] = (byte)(readPeerCtrs[1] + 1);
               // put whatever view peer 1 has of peer 0's ctr in peerCtrs[0]
               peerCtrs[0] = readPeerCtrs[0];
               // Now till they both have seen each other once this will keep trying to reconnect
+            }
+
+            if (peerCtrs[0] == 1 && peerCtrs[1] == 1)
+            {
+              connected = true;
+              break;
             }
           }
         }
