@@ -63,6 +63,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   private const int TIMEOUT_SECS = 10;
 
   // Non-static fields
+  private readonly bool _useProbabilisticABAssignment = true;
   private readonly IConnectionMultiplexer _connectionMultiplexer;
   private readonly string _selfId;
   private readonly byte[] _internalBuffer = new byte[1024];
@@ -167,6 +168,8 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         Debug.Assert(_registrationRetryCount == 0, "Invariant Violation: Retry count should be 0 in initial state");
         Debug.Assert(_sendPunchRetryCount == 0, "Invariant Violation: Send punch retry count should be 0 in initial state");
 
+        _isSelfA = string.CompareOrdinal(_selfId, _peerId) < 0; // Since peer ids are unique this will always deterministically assign one peer as A and the other as B
+
         _logger?.LogDebug("HolePunching: Initializing UDP socket and registering with server");
 
         // Initialize UDP socket and register self and port with server
@@ -218,10 +221,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           await Task.Delay(2_000); // Wait and let the next next() invocation retry
           break;
         }
-
-        // This problem can be solved with depending on probability and by adding a level of randomization to who becomes A and who becomes B
-        // The reliance on a central server is not a great thing here. Although the reliance is minimal and only for initial connection
-        await ManageABAssignment();
 
         // peer we want to connect to has also registered, parse their info
         _registrationRetryCount = 0;
@@ -341,7 +340,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           _udpSocket = null;
         }
 
-
         _registrationRetryCount = 0;
         _sendPunchRetryCount = 0;
         _peerId = null;
@@ -361,16 +359,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   {
     IDatabase db = _connectionMultiplexer.GetDatabase();
     return db.StringSetAsync(_selfId, $"{publicIp}:{externalPort}", expiry: TimeSpan.FromMinutes(SESSION_LIFETIME_MINS)); // Sessions are 10 minutes long...
-  }
-
-  private async Task ManageABAssignment()
-  {
-    // connection between self Identifider and peerIdentifier should at any given point only have one "A" and one "B" in the pair
-    IDatabase db = _connectionMultiplexer.GetDatabase();
-    string compositeKey = _selfId.CompareTo(_peerId!) < 0 ? $"{_selfId}:{_peerId}" : $"{_peerId}:{_selfId}"; // sorted lexicographically
-    // now if this key already exists tell me who was A and update expiration. If it does not exist make me A
-    string? result = await db.StringSetAndGetAsync("AB:" + compositeKey, _selfId, expiry: TimeSpan.FromMinutes(SESSION_LIFETIME_MINS), when: When.NotExists);
-    _isSelfA = result == null || result == _selfId;
   }
 
   private Task DeregisterFromServerAsync()
