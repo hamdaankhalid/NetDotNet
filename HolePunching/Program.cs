@@ -262,11 +262,10 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           if (_udpSocket.Poll(250_000, SelectMode.SelectRead)) // microseconds - 250ms between sends
           {
             int receiveResult = _udpSocket.ReceiveFrom(readPeerCtrs, SocketFlags.None, ref tempEndPoint);
-            _logger?.LogDebug("HolePunching: Received {ByteCount} bytes from peer!", receiveResult);
             if (receiveResult > 0)
             {
-              // Tell peer 1 that peer 0 has recvd the packet by incrementing peerCtrs[1]
-              peerCtrs[1] = (byte)(readPeerCtrs[1] + 1);
+              // Tell peer 1 that peer 0 has recvd the packet by setting to 1. This might worth using incrementing peerCtrs[1]
+              peerCtrs[1] = 1;
               // put whatever view peer 1 has of peer 0's ctr in peerCtrs[0]
               peerCtrs[0] = readPeerCtrs[0];
               // Now till they both have seen each other once this will keep trying to reconnect
