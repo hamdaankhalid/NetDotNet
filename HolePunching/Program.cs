@@ -43,11 +43,11 @@ internal class HolePunchingStateMachine : IDisposable
 
   private readonly IConnectionMultiplexer _connectionMultiplexer;
   private readonly string _selfIp;
-  // small buffer for receiving punch response
   private readonly byte[] _internalBuffer = new byte[1024]; 
-
+  private readonly int _maxRetryCount;
 
   // State variables
+  private int _retryCount = 0;
   private IPAddress? _peerIp;
   private int _peerPort;
   private IPEndPoint? _peerEndPoint;
@@ -73,10 +73,12 @@ internal class HolePunchingStateMachine : IDisposable
     }
   }
 
-  public HolePunchingStateMachine(string registrationServerAddr)
+  public HolePunchingStateMachine(string registrationServerAddr, int maxRetryCount = 5)
   {
+    // HK TODO: configure connection options for retries in interacting with our rendezvous server
     _connectionMultiplexer = ConnectionMultiplexer.Connect(registrationServerAddr);
     _selfIp = Dns.GetHostEntry(Dns.GetHostName()).AddressList[0].ToString();
+    _maxRetryCount = maxRetryCount;
   }
 
   public async Task<bool> ConnectAsync(IPAddress destinationIp)
@@ -108,6 +110,7 @@ internal class HolePunchingStateMachine : IDisposable
         Debug.Assert(_peerIp != null, "Invariant Violation: Set by ConnectAsync before calling Next()");
         Debug.Assert(_peerPort == 0, "Invariant Violation: Will be set once we get peer info from server so currenty should be 0"); 
         Debug.Assert(_peerEndPoint == null, "Invariant Violation: Will be set once we get peer info from server so currenty should be null");
+        Debug.Assert(_retryCount == 0, "Invariant Violation: Retry count should be 0 in initial state");
 
         // Initialize UDP socket and register self and port with server
         _udpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
@@ -125,17 +128,26 @@ internal class HolePunchingStateMachine : IDisposable
         Debug.Assert(_peerPort == 0, "Invariant Violation: Will be set once we get peer info from server so currenty should be 0"); 
         Debug.Assert(_peerEndPoint == null, "Invariant Violation: Will be set once we get peer info from server so currenty should be null");
 
+        if (_retryCount >= _maxRetryCount)
+        {
+          // Exceeded max retries, mark as failed
+          CurrentState = HolePunchingStates.Failed;
+          break;
+        }
+
         // Wait for peer info from server
         IDatabase db = _connectionMultiplexer.GetDatabase();
         string? peerEphemeralPort = await db.StringGetAsync(_peerIp!.ToString()); // Any stackexchange issues will throw exceptions and propagate up and that is okay.
         if (peerEphemeralPort == null)
         {
+          _retryCount++;
           // Peer info not yet available
           await Task.Delay(500); // Wait and let the next next() invocation retry
           break;
         }
       
         // Got peer info!
+        _retryCount = 0;
         _peerPort = int.Parse(peerEphemeralPort);
         _peerEndPoint = new IPEndPoint(_peerIp!, _peerPort);
         CurrentState = HolePunchingStates.ReceivedPeerInfo;
@@ -145,6 +157,13 @@ internal class HolePunchingStateMachine : IDisposable
         Debug.Assert(_peerIp != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
         Debug.Assert(_peerPort >= 0, "Invariant Violation: Should have been received from server in previous state RegisteredWithServer"); 
         Debug.Assert(_peerEndPoint != null, "Invariant Violation: Should have been created in previous state RegisteredWithServer");
+
+        if (_retryCount >= _maxRetryCount)
+        {
+          // Exceeded max retries, mark as failed
+          CurrentState = HolePunchingStates.Failed;
+          break;
+        }
       
         // Send punch packet to peer
         byte[] punchPacket = System.Text.Encoding.UTF8.GetBytes("Punch");
@@ -156,12 +175,15 @@ internal class HolePunchingStateMachine : IDisposable
         {
           // HK TODO: Add retry limit to avoid infinite loop here!
           // Retry from RegisteredWithServer state
+          _retryCount++;
           CurrentState = HolePunchingStates.RegisteredWithServer;
           _peerPort = 0; // reset the state so RegisteredWithServer can re-fetch peer info from server
           _peerEndPoint = null;
+          await Task.Delay(500); // Wait before retrying
           break;
         }
       
+        _retryCount = 0;
         await Task.Delay(100); // Give some time for NAT to process the punch packet? HK TODO: not sure if this is needed.
         CurrentState = HolePunchingStates.SentPunchPacket;
         break;
@@ -170,21 +192,28 @@ internal class HolePunchingStateMachine : IDisposable
         Debug.Assert(_peerIp != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
         Debug.Assert(_peerPort >= 0, "Invariant Violation: Should have been received from server in previous state RegisteredWithServer");
         Debug.Assert(_peerEndPoint != null, "Invariant Violation: Should have been created in previous state RegisteredWithServer");
-  
+
+        if (_retryCount >= _maxRetryCount)
+        {
+          // Exceeded max retries, mark as failed
+          CurrentState = HolePunchingStates.Failed;
+          break;
+        }
+      
         // Wait for response from peer
         SocketReceiveFromResult receiveResult = await _udpSocket.ReceiveFromAsync(_internalBuffer, SocketFlags.None, _peerEndPoint);
-        if (receiveResult.ReceivedBytes > 0)
+        if (receiveResult.ReceivedBytes <= 0)
         {
-          // Successfully received response from peer
-          CurrentState = HolePunchingStates.EstablishedConnection;
-        }
-        else
-        {
-          // No response yet, retry sending punch packet by moving one level back on state where we will resend punch packet incase the first was not received
-          // HK TODO: add retry limit to avoid infinite loop here!
+          _retryCount++;
+          // Peer may not have registered yet
+          // retry sending punch packet by moving one level back on state where we will resend punch packet incase the first was not received
           CurrentState = HolePunchingStates.ReceivedPeerInfo;
+          await Task.Delay(500); // Wait before retrying
         }
 
+        // Successfully received response from peer
+        _retryCount = 0;
+        CurrentState = HolePunchingStates.EstablishedConnection;
         break;
       case HolePunchingStates.EstablishedConnection:
         Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial");
@@ -193,9 +222,13 @@ internal class HolePunchingStateMachine : IDisposable
         Debug.Assert(_peerEndPoint != null, "Invariant Violation: Should have been created in previous state RegisteredWithServer");
 
         // If next was called on this state, then the want is to close the connection.
-        ResetForFutureConnections();
+        ResetForFutureConnections(); // Happy path closing!
         break;
-      case HolePunchingStates.Failed:
+
+      case HolePunchingStates.Failed: 
+        // HK TODO: Currently nobody is setting this state. This is what will be set when something has been retried multiple times and we give up.
+        Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial");
+
         // If someone calls connect again on a failed connection we can restart from initial
         ResetForFutureConnections();
         break;
@@ -215,7 +248,8 @@ internal class HolePunchingStateMachine : IDisposable
     {
       DeregisterFromServer();
     }
-  
+
+    _retryCount = 0; 
     _peerIp = null;
     _peerPort = 0;
     _peerEndPoint = null!;
