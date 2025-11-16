@@ -63,10 +63,8 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   private const int TIMEOUT_SECS = 10;
 
   // Non-static fields
-  private readonly bool _useProbabilisticABAssignment = true;
   private readonly IConnectionMultiplexer _connectionMultiplexer;
   private readonly string _selfId;
-  private readonly byte[] _internalBuffer = new byte[1024];
   private readonly int _maxRetryCount;
   private readonly ILogger? _logger;
 
