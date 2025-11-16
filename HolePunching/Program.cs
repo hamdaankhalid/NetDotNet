@@ -75,8 +75,19 @@ internal class HolePunchingStateMachine : IDisposable
 
   public HolePunchingStateMachine(string registrationServerAddr, int maxRetryCount = 5)
   {
-    // HK TODO: configure connection options for retries in interacting with our rendezvous server
-    _connectionMultiplexer = ConnectionMultiplexer.Connect(registrationServerAddr);
+    if (maxRetryCount < 0)
+    {
+      throw new ArgumentOutOfRangeException(nameof(maxRetryCount));
+    }
+  
+    ConfigurationOptions option = ConfigurationOptions.Parse(registrationServerAddr);
+    option.ConnectRetry = maxRetryCount;
+    option.ConnectTimeout = 5000; // 5 seconds
+    option.SyncTimeout = 5000; // 5 seconds
+    option.KeepAlive = 60; // seconds
+
+    _connectionMultiplexer = ConnectionMultiplexer.Connect(option);
+
     _selfIp = Dns.GetHostEntry(Dns.GetHostName()).AddressList[0].ToString();
     _maxRetryCount = maxRetryCount;
   }
@@ -173,7 +184,6 @@ internal class HolePunchingStateMachine : IDisposable
         }
         catch (SocketException)
         {
-          // HK TODO: Add retry limit to avoid infinite loop here!
           // Retry from RegisteredWithServer state
           _retryCount++;
           CurrentState = HolePunchingStates.RegisteredWithServer;
@@ -226,7 +236,6 @@ internal class HolePunchingStateMachine : IDisposable
         break;
 
       case HolePunchingStates.Failed: 
-        // HK TODO: Currently nobody is setting this state. This is what will be set when something has been retried multiple times and we give up.
         Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial");
 
         // If someone calls connect again on a failed connection we can restart from initial
