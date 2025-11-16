@@ -1,9 +1,11 @@
-﻿using System.ComponentModel;
-using System.Diagnostics;
+﻿using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
+
+# region Protocol Implementation
 
 /* UDP Hole punching client
 Technique to enable direct communication between two clients behind NATs by using a third-party server to coordinate the connection.
@@ -28,26 +30,25 @@ Both clients open ephemeral ports acting as clients making outbound connections.
 NAT thinks both peers are "replying" to outbound connections.
 and thus without any listening sockets you have peer to peer communication.
 */
-enum HolePunchingStates
+
+enum HolePunchingState
 {
+  // move to RegisteredWithServer by contacting STUN server and registering with registration server
   Initial = 0,
+  // check if peer has also registered, if not retry till max retries reached, then move to ReceivedPeerInfo
   RegisteredWithServer,
+  // try to do hole punching by sending packets to peer's external IP:port, move to EstablishedConnection on success else refetch peer info and retry (move back to RegisteredWithServer)
   ReceivedPeerInfo,
-  SentPunchPacket,
+  // connection established, can now use the UDP socket for communication, if Next() is called again will move to Closed
   EstablishedConnection,
-  Failed
+  // perform cleanup of resources and deregister from server, then move back to Initial for potential future connections
+  Closed,
 }
 
-// Protocol state machine for hole punching process
 internal class HolePunchingStateMachine : IDisposable
 {
-  private readonly IConnectionMultiplexer _connectionMultiplexer;
-  private readonly string _selfId;
-  private readonly byte[] _internalBuffer = new byte[1024];
-  private readonly int _maxRetryCount;
-  private readonly ILogger? _logger;
   // STUN is used as a way to get public IP and port mapping from NAT
-  private readonly string[] _stunServers = new string[]
+  private static readonly string[] STUN_SERVERS = new string[]
   {
     "stun.l.google.com:19302",
     "stun1.l.google.com:19302",
@@ -55,13 +56,22 @@ internal class HolePunchingStateMachine : IDisposable
     "stun3.l.google.com:19302",
     "stun4.l.google.com:19302",
   };
+
   private readonly static byte[] PUNCH_PACKET = System.Text.Encoding.UTF8.GetBytes("HolePunching: Punch Packet");
+
   // Session lifetime for registration with server, after these minutes the server will evict our registration
   // this will not impact active connections but will require re-registration for future connections
   private const int SESSION_LIFETIME_MINS = 10;
   private const int TIMEOUT_SECS = 10;
 
-  // State variables
+  // Non-static fields
+  private readonly IConnectionMultiplexer _connectionMultiplexer;
+  private readonly string _selfId;
+  private readonly byte[] _internalBuffer = new byte[1024];
+  private readonly int _maxRetryCount;
+  private readonly ILogger? _logger;
+
+  // State - Mutable fields 
   private int _registrationRetryCount = 0;
   private int _sendPunchRetryCount = 0;
   private IPAddress? _peerIp;
@@ -73,7 +83,7 @@ internal class HolePunchingStateMachine : IDisposable
   // IDisposable support
   private bool disposedValue;
 
-  private HolePunchingStates CurrentState { get; set; } = HolePunchingStates.Initial;
+  private HolePunchingState CurrentState { get; set; } = HolePunchingState.Initial;
 
   // This is the primary inteface to get the hole punched socket once connection is established
   // The user should not dispose this socket, it will be disposed when the state machine is disposed
@@ -81,7 +91,7 @@ internal class HolePunchingStateMachine : IDisposable
   {
     get
     {
-      if (CurrentState != HolePunchingStates.EstablishedConnection)
+      if (CurrentState != HolePunchingState.EstablishedConnection)
       {
         throw new InvalidOperationException("Connection not yet established.");
       }
@@ -111,32 +121,48 @@ internal class HolePunchingStateMachine : IDisposable
 
   public async Task<bool> ConnectAsync(string peerId)
   {
-    // Can only connect on initial or failed state
-    if (CurrentState != HolePunchingStates.Initial && CurrentState != HolePunchingStates.Failed)
+    if (CurrentState != HolePunchingState.Initial)
     {
       throw new InvalidOperationException($"Connection process already started. {CurrentState}");
     }
 
     _peerId = peerId;
 
-    // Main loop to progress through states till connection is established or failed
-    while (CurrentState != HolePunchingStates.EstablishedConnection && CurrentState != HolePunchingStates.Failed)
+    // Main loop to progress through states till connection is established or failed (went all the way back to initial)
+    HolePunchingState currentState = CurrentState;
+    HolePunchingState nextState;
+    do
     {
-      _logger?.LogDebug($"HolePunching: Current state {CurrentState}, retry count {_registrationRetryCount}, " +
-        $"send punch retry count {_sendPunchRetryCount}");
-      await Next();
-      await Task.Delay(100); // slight delay to avoid busy loop
+      nextState = await Next();
+      _logger?.LogDebug("HolePunching State Transition: {CurrentState} => state {NextState}, retry count {RegistrationRetryCount}, send punch retry count {SendPunchRetryCount}",
+        currentState, nextState, _registrationRetryCount, _sendPunchRetryCount);
     }
+    while (nextState != HolePunchingState.EstablishedConnection && nextState != HolePunchingState.Initial);
 
     // Connection established or failed
-    return CurrentState == HolePunchingStates.EstablishedConnection;
+    return CurrentState != HolePunchingState.EstablishedConnection;
   }
 
-  private async Task Next()
+  public async Task CloseAsync()
+  {
+    // Connection should have already been in EstablishedConnection state for close to be viable
+    if (CurrentState != HolePunchingState.EstablishedConnection)
+    {
+      throw new InvalidOperationException("Connection not yet established.");
+    }
+
+    HolePunchingState currentState = CurrentState;
+    await Next(); // Move to Closed state and cleanup
+    _logger?.LogDebug("HolePunching State Transition: {CurrentState} => state {NextState}, retry count {RegistrationRetryCount}, send punch retry count {SendPunchRetryCount}", 
+      currentState, CurrentState, _registrationRetryCount, _sendPunchRetryCount);
+  }
+
+  // Advance the state machine to the next state returning the new state
+  private async Task<HolePunchingState> Next()
   {
     switch (CurrentState)
     {
-      case HolePunchingStates.Initial: // At this stage we don't have an active UDP socket yet and have not registered our ephemeral port with server since we don't know it yet
+      case HolePunchingState.Initial: // At this stage we don't have an active UDP socket yet and have not registered our ephemeral port with server since we don't know it yet
         Debug.Assert(_peerId != null, "Invariant Violation: Set by ConnectAsync before calling Next()");
         Debug.Assert(_udpSocket == null, "Invariant Violation: No UDP socket should exist in initial state");
         Debug.Assert(_peerIp == null, "Invariant Violation: if we have not yet received peer info from server this should still be null");
@@ -155,20 +181,20 @@ internal class HolePunchingStateMachine : IDisposable
         if (isSymmetricNat)
         {
           _logger?.LogError("HolePunching: Symmetric NAT detected, hole punching will fail");
-          CurrentState = HolePunchingStates.Failed;
+          CurrentState = HolePunchingState.Closed;
           break;
         }
 
         _logger?.LogDebug("HolePunching: NAT is not symmetric, proceeding with hole punching");
 
         // get which is the port the above socket is bound to externally via NAT using STUN
-        (IPAddress publicIp, int ephemeralPort) = await StunRequestAsync();
+        (IPAddress publicIp, int ephemeralPort) = await MinimalStunClient.GetStunPortAsync(_udpSocket, STUN_SERVERS);
+
         await RegisterWithServerAsync(publicIp, ephemeralPort); // Let any failure in registration propagate up, redis stack exchange client should have already retried internally if needed
 
-        _logger?.LogDebug("HolePunching: Registered with server");
-        CurrentState = HolePunchingStates.RegisteredWithServer;
+        CurrentState = HolePunchingState.RegisteredWithServer;
         break;
-      case HolePunchingStates.RegisteredWithServer:
+      case HolePunchingState.RegisteredWithServer:
         Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial");
         Debug.Assert(_peerId != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
         Debug.Assert(_peerIp == null, "Invariant Violation: if we have not yet received peer info from server this should still be null");
@@ -178,7 +204,7 @@ internal class HolePunchingStateMachine : IDisposable
         if (_registrationRetryCount >= _maxRetryCount)
         {
           // Exceeded max retries, mark as failed
-          CurrentState = HolePunchingStates.Failed;
+          CurrentState = HolePunchingState.Closed;
           break;
         }
 
@@ -191,7 +217,8 @@ internal class HolePunchingStateMachine : IDisposable
         {
           _registrationRetryCount++;
           // Peer info not yet available
-          _logger?.LogDebug($"HolePunching: Peer info not yet available, retrying... {_registrationRetryCount}/{_maxRetryCount}");
+          _logger?.LogDebug("HolePunching: Peer info not yet available, retrying... {RegistrationRetryCount}/{MaxRetryCount}",
+            _registrationRetryCount, _maxRetryCount);
           await Task.Delay(2_000); // Wait and let the next next() invocation retry
           break;
         }
@@ -202,10 +229,11 @@ internal class HolePunchingStateMachine : IDisposable
         _peerIp = IPAddress.Parse(peerParts[0]);
         _peerPort = int.Parse(peerParts[1]);
         _peerEndPoint = new IPEndPoint(_peerIp, _peerPort);
-        _logger?.LogDebug($"HolePunching: Received peer info: {peerInfo}");
-        CurrentState = HolePunchingStates.ReceivedPeerInfo;
+        _logger?.LogDebug("HolePunching: Received peer info: {PeerInfo}", peerInfo);
+        CurrentState = HolePunchingState.ReceivedPeerInfo;
         break;
-      case HolePunchingStates.ReceivedPeerInfo:
+
+      case HolePunchingState.ReceivedPeerInfo:
         Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial");
         Debug.Assert(_peerIp != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
         Debug.Assert(_peerId != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
@@ -215,30 +243,31 @@ internal class HolePunchingStateMachine : IDisposable
         if (_sendPunchRetryCount >= _maxRetryCount)
         {
           // Exceeded max retries, mark as failed
-          CurrentState = HolePunchingStates.Failed;
+          CurrentState = HolePunchingState.Closed;
           _logger?.LogDebug("HolePunching: Exceeded max retries, marking as failed");
           break;
         }
 
+        // CORE LOGIC OF HOLE PUNCHING
         _logger?.LogDebug("HolePunching: Sending punch packet to peer");
 
         int receiveResult = 0;
         int maxAttempts = TIMEOUT_SECS * 4;
-        EndPoint tempEndPoint = _peerEndPoint;
+        EndPoint tempEndPoint = _peerEndPoint; // only need to do this so I can pass it by ref
         for (int i = 0; i < maxAttempts; i++)
         {
           _udpSocket.SendTo(PUNCH_PACKET, SocketFlags.None, _peerEndPoint);
 
           if (i % 10 == 0 && i != 0)
           {
-            _logger?.LogDebug($"HolePunching: Sent {i} punch packets to peer, waiting for response...");
+            _logger?.LogDebug("HolePunching: Sent {PacketCount} punch packets to peer, waiting for response...", i);
           }
 
           // Poll to see if data is available (increased poll time to 250ms for better timing)
           if (_udpSocket.Poll(250_000, SelectMode.SelectRead)) // microseconds - 250ms between sends
           {
             receiveResult = _udpSocket.ReceiveFrom(_internalBuffer, SocketFlags.None, ref tempEndPoint);
-            _logger?.LogDebug($"HolePunching: Received {receiveResult} bytes from peer!");
+            _logger?.LogDebug("HolePunching: Received {ByteCount} bytes from peer!", receiveResult);
             break; // Got response!
           }
         }
@@ -247,67 +276,56 @@ internal class HolePunchingStateMachine : IDisposable
         {
           _sendPunchRetryCount++;
           // Peer may not have registered yet
-          // retry sending punch packet by moving one level back on state where we will resend punch packet incase the first was not received
-          CurrentState = HolePunchingStates.ReceivedPeerInfo;
+          // retry sending punch packet by moving one level back on state where we will reget Peer's info and resend punch packet incase the first was not received
+          CurrentState = HolePunchingState.RegisteredWithServer;
           _logger?.LogDebug("HolePunching: Did not receive response from peer, retrying...");
           break;
         }
 
         // Successfully received response from peer
         _sendPunchRetryCount = 0;
-        CurrentState = HolePunchingStates.EstablishedConnection;
-        _logger?.LogDebug("HolePunching: Established connection with peer!");
+        CurrentState = HolePunchingState.EstablishedConnection;
         break;
-      case HolePunchingStates.EstablishedConnection:
+
+      case HolePunchingState.EstablishedConnection:
         Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial");
         Debug.Assert(_peerId != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
         Debug.Assert(_peerIp != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
         Debug.Assert(_peerPort >= 0, "Invariant Violation: Should have been received from server in previous state RegisteredWithServer");
         Debug.Assert(_peerEndPoint != null, "Invariant Violation: Should have been created in previous state RegisteredWithServer");
 
-        _logger?.LogDebug("HolePunching: Closing established connection with peer");
-
-        // If next was called on this state, then the want is to close the connection.
-        await ResetForFutureConnections(); // Happy path closing!
-
-        _logger?.LogDebug("HolePunching: Closed established connection with peer");
+        CurrentState = HolePunchingState.Closed;
         break;
 
-      case HolePunchingStates.Failed:
+      case HolePunchingState.Closed:
         Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial");
 
-        _logger?.LogDebug("HolePunching: Connection failed");
+        // If next was called on this state, then the want is to close the connection.
+        // if state was past RegisteredWithServer we need to deregister from server as a best effort way otherwise TTL will expire our registration in worst case!
+        if (CurrentState != HolePunchingState.Initial)
+        {
+          await DeregisterFromServerAsync();
+        }
 
-        // If someone calls connect again on a failed connection we can restart from initial
-        await ResetForFutureConnections();
+        if (_udpSocket != null)
+        {
+          _udpSocket.Dispose();
+          _udpSocket = null;
+        }
 
-        _logger?.LogDebug("HolePunching: Reset for future connections after failure");
+
+        _registrationRetryCount = 0;
+        _sendPunchRetryCount = 0;
+        _peerId = null;
+        _peerIp = null;
+        _peerPort = 0;
+        _peerEndPoint = null!;
+
+        CurrentState = HolePunchingState.Initial;
         break;
     }
-  }
 
-  private async Task ResetForFutureConnections()
-  {
-    if (_udpSocket != null)
-    {
-      _udpSocket.Dispose();
-      _udpSocket = null;
-    }
-
-    // if state was past RegisteredWithServer we need to deregister from server as a best effort way otherwise TTL will expire our registration in worst case!
-    if (CurrentState != HolePunchingStates.Initial)
-    {
-      await DeregisterFromServerAsync();
-    }
-
-    _registrationRetryCount = 0;
-    _sendPunchRetryCount = 0;
-    _peerId = null;
-    _peerIp = null;
-    _peerPort = 0;
-    _peerEndPoint = null!;
-
-    CurrentState = HolePunchingStates.Initial; // Reset to initial for potential future connections
+    return CurrentState;
   }
 
   private Task RegisterWithServerAsync(IPAddress publicIp, int externalPort)
@@ -320,12 +338,6 @@ internal class HolePunchingStateMachine : IDisposable
   {
     IDatabase db = _connectionMultiplexer.GetDatabase();
     return db.KeyDeleteAsync(_selfId);
-  }
-
-  private Task<(IPAddress publicIp, int publicPort)> StunRequestAsync()
-  {
-    Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial before calling this method");
-    return MinimalStunClient.GetStunPortAsync(_udpSocket, _stunServers);
   }
 
   protected virtual void Dispose(bool disposing)
@@ -350,6 +362,8 @@ internal class HolePunchingStateMachine : IDisposable
   }
 }
 
+#endregion
+
 // This is a minimal STUN client implementation to get public IP and port mapping from NAT
 // I don't need anything else so I'm not even parsing full messages, just give me the bytes I need damn it
 static class MinimalStunClient
@@ -364,7 +378,7 @@ static class MinimalStunClient
     // Run sequentially, not in parallel!
     (IPAddress publicIp, int publicPort) result1 = await GetStunPortAsync(udpSocket, new string[] { stunServer1 });
     (IPAddress publicIp, int publicPort) result2 = await GetStunPortAsync(udpSocket, new string[] { stunServer2 });
-  
+
     return result1.publicPort != result2.publicPort;
   }
 
@@ -422,6 +436,7 @@ static class MinimalStunClient
 
 public sealed class HOPPeer : IDisposable
 {
+  private readonly Object _socketLock = new Object();
   private readonly HolePunchingStateMachine _stateMachine;
 
   public HOPPeer(string discoverableId, string registrationServerAddr, ILogger? logger = null)
@@ -434,9 +449,25 @@ public sealed class HOPPeer : IDisposable
     return await _stateMachine.ConnectAsync(peerId); // use await here to propagate exceptions showing connection failure explicitly here
   }
 
-  public int Send(ReadOnlySpan<byte> data) => _stateMachine.HolePunchedSocket.Send(data);
+  public int Send(ReadOnlySpan<byte> data)
+  {
+    lock (_socketLock)
+    {
+      return _stateMachine.HolePunchedSocket.Send(data);
+    }
+  }
 
-  public int Receive(Span<byte> buffer) => _stateMachine.HolePunchedSocket.Receive(buffer);
+  public int Receive(Span<byte> buffer, int receiveTimeoutMs = 250)
+  {
+    lock (_socketLock)
+    {
+      if (_stateMachine.HolePunchedSocket.Poll(receiveTimeoutMs * 1_000, SelectMode.SelectRead) == false)
+      {
+        return 0; // timeout
+      }
+      return _stateMachine.HolePunchedSocket.Receive(buffer);
+    }
+  }
 
   public void Close() => throw new NotImplementedException();
 
@@ -492,9 +523,12 @@ internal class Program
         byte[] receiveBuffer = new byte[1024];
         while (!cts.IsCancellationRequested)
         {
-          int receivedBytes = peer.Receive(receiveBuffer);
-          string message = System.Text.Encoding.UTF8.GetString(receiveBuffer, 0, receivedBytes);
-          Console.WriteLine($"Received{indentationOfReadMessages}{message}");
+          int receivedBytes = peer.Receive(receiveBuffer, 250);
+          if (receivedBytes > 0)
+          {
+            string message = System.Text.Encoding.UTF8.GetString(receiveBuffer, 0, receivedBytes);
+            Console.WriteLine($"Received{indentationOfReadMessages}{message}");
+          }
           await Task.Delay(250, cts.Token); // slight delay to avoid busy loop
         }
       }
