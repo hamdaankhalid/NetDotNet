@@ -1,7 +1,6 @@
 ﻿using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Threading.Tasks;
 using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
 
@@ -35,17 +34,18 @@ enum HolePunchingState
 {
   // move to RegisteredWithServer by contacting STUN server and registering with registration server
   Initial = 0,
-  // check if peer has also registered, if not retry till max retries reached, then move to ReceivedPeerInfo
+  // check if peer has also registered, if not retry till max retries reached, then move to ReceivedPeerInfo. If max retries reached move to Closed
   RegisteredWithServer,
   // try to do hole punching by sending packets to peer's external IP:port, move to EstablishedConnection on success else refetch peer info and retry (move back to RegisteredWithServer)
+  // if max retries reached move to Closed
   ReceivedPeerInfo,
-  // connection established, can now use the UDP socket for communication, if Next() is called again will move to Closed
+  // connection established, can now use the UDP socket for communication, if Next() is called again, move to Closed
   EstablishedConnection,
   // perform cleanup of resources and deregister from server, then move back to Initial for potential future connections
   Closed,
 }
 
-internal class HolePunchingStateMachine : IDisposable
+internal class HolePunchingStateMachine : IAsyncDisposable
 {
   // STUN is used as a way to get public IP and port mapping from NAT
   private static readonly string[] STUN_SERVERS = new string[]
@@ -64,7 +64,7 @@ internal class HolePunchingStateMachine : IDisposable
   private const int SESSION_LIFETIME_MINS = 10;
   private const int TIMEOUT_SECS = 10;
 
-  // Non-static fields
+  // Non-static RO fields
   private readonly IConnectionMultiplexer _connectionMultiplexer;
   private readonly string _selfId;
   private readonly byte[] _internalBuffer = new byte[1024];
@@ -72,8 +72,8 @@ internal class HolePunchingStateMachine : IDisposable
   private readonly ILogger? _logger;
 
   // State - Mutable fields 
-  private int _registrationRetryCount = 0;
-  private int _sendPunchRetryCount = 0;
+  private int _registrationRetryCount;
+  private int _sendPunchRetryCount;
   private IPAddress? _peerIp;
   private string? _peerId;
   private int _peerPort;
@@ -81,7 +81,7 @@ internal class HolePunchingStateMachine : IDisposable
   private Socket? _udpSocket;
 
   // IDisposable support
-  private bool disposedValue;
+  private bool _isDisposed;
 
   private HolePunchingState CurrentState { get; set; } = HolePunchingState.Initial;
 
@@ -102,10 +102,7 @@ internal class HolePunchingStateMachine : IDisposable
 
   public HolePunchingStateMachine(string selfId, string registrationServerAddr, int maxRetryCount = 5, ILogger? logger = null)
   {
-    if (maxRetryCount < 0)
-    {
-      throw new ArgumentOutOfRangeException(nameof(maxRetryCount));
-    }
+    ArgumentOutOfRangeException.ThrowIfNegative(maxRetryCount);
 
     ConfigurationOptions options = ConfigurationOptions.Parse(registrationServerAddr);
     options.ConnectRetry = maxRetryCount;
@@ -340,25 +337,29 @@ internal class HolePunchingStateMachine : IDisposable
     return db.KeyDeleteAsync(_selfId);
   }
 
-  protected virtual void Dispose(bool disposing)
+  public async ValueTask DisposeAsync()
   {
-    if (!disposedValue)
+    if (!_isDisposed)
     {
-      if (disposing)
+      // Close the connection if it's established (deregister from server, cleanup socket)
+      if (CurrentState == HolePunchingState.EstablishedConnection)
       {
-        _udpSocket?.Dispose();
-        _connectionMultiplexer.Dispose();
+        try
+        {
+          await CloseAsync();
+        }
+        catch
+        {
+          // Best effort - continue with disposal even if close fails
+        }
       }
-
-      disposedValue = true;
+      
+      // Dispose any remaining resources
+      _udpSocket?.Dispose();
+      await _connectionMultiplexer.CloseAsync();
+      _connectionMultiplexer.Dispose();
+      _isDisposed = true;
     }
-  }
-
-  public void Dispose()
-  {
-    // Do not change this code. Put cleanup code in 'Dispose(bool disposing)' method
-    Dispose(disposing: true);
-    GC.SuppressFinalize(this);
   }
 }
 
@@ -434,7 +435,7 @@ static class MinimalStunClient
   }
 }
 
-public sealed class HOPPeer : IDisposable
+public sealed class HOPPeer : IAsyncDisposable
 {
   private readonly Object _socketLock = new Object();
   private readonly HolePunchingStateMachine _stateMachine;
@@ -469,9 +470,9 @@ public sealed class HOPPeer : IDisposable
     }
   }
 
-  public void Close() => throw new NotImplementedException();
+  public async Task CloseAsync() => await _stateMachine.CloseAsync();
 
-  public void Dispose() => _stateMachine.Dispose();
+  public ValueTask DisposeAsync() => _stateMachine.DisposeAsync();
 }
 
 // Sample program showing how to use the above Hole Punched Peer class to establish a hole punched connection and send/receive data
@@ -494,7 +495,7 @@ internal class Program
 
     ILogger logger = loggerFactory.CreateLogger<Program>();
 
-    using HOPPeer peer = new HOPPeer(selfIdentification, registrationServerAddr, logger);
+    await using HOPPeer peer = new HOPPeer(selfIdentification, registrationServerAddr, logger);
 
     Console.WriteLine("Press enter to start connection to peer...");
 
