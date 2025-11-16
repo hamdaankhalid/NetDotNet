@@ -292,7 +292,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
             }
 
             // Both reads indicate that both peers have seen each other at least once
-            if (readPeerCtrs[0] == 1 && readPeerCtrs[1] == 1)
+            if (readPeerCtrs[0] == 1 && readPeerCtrs[1] == 1 && peerCtrs[0] == 1 && peerCtrs[1] == 1)
             {
               connected = true;
               break;
