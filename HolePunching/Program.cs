@@ -281,7 +281,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
             break;
           }
 
-          Array.Fill(readPeerCtrs, (byte)0);
+          // Array.Fill(readPeerCtrs, (byte)0);
 
           // send local view of ctrs
           _udpSocket.SendTo(writePeerCtrs, SocketFlags.None, _peerEndPoint);
