@@ -266,7 +266,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         byte[] readPeerCtrs = new byte[2];
         byte[] writePeerCtrs = new byte[2];
 
-        int maxAttempts = TIMEOUT_SECS * 40;
+        int maxAttempts = TIMEOUT_SECS * 4;
         EndPoint tempEndPoint = _peerEndPoint; // only need to do this so I can pass it by ref
         bool connected = false;
         _udpSocket.ReceiveTimeout = 250;
