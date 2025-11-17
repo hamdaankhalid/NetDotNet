@@ -275,7 +275,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           _logger?.LogDebug("Ack-Syn State WRITE BUF peerA: {}, peerB: {}", writePeerCtrs[0], writePeerCtrs[1]);
           _logger?.LogDebug("Ack-Syn State READ BUF peerA: {}, peerB: {}", readPeerCtrs[0], readPeerCtrs[1]);
 
-          if (readPeerCtrs[0] == 1 && readPeerCtrs[1] == 1 && writePeerCtrs[0] == 1 && writePeerCtrs[1] == 1)
+          if (readPeerCtrs[0] == 2 && readPeerCtrs[1] == 2 && writePeerCtrs[0] == 2 && writePeerCtrs[1] == 2)
           {
             connected = true;
             break;
@@ -297,12 +297,12 @@ internal class HolePunchingStateMachine : IAsyncDisposable
                 // put whatever view peer 1 has of peer 0's ctr in peerCtrs[0]
                 writePeerCtrs[0] = readPeerCtrs[0];
                 // Tell peer 1 that peer 0 has recvd the packet by setting to 1. This might worth using incrementing peerCtrs[1]
-                writePeerCtrs[1] = 1;
+                writePeerCtrs[1] = readPeerCtrs[1] == 0 ? (byte)1 : (byte)2;
               }
               else
               {
                 // Tell peer 0 that peer 1 has recvd the packet by setting to 1. This might worth using incrementing peerCtrs[0]
-                writePeerCtrs[0] = 1;
+                writePeerCtrs[0] = readPeerCtrs[0] == 0 ? (byte)1 : (byte)2;
                 // put whatever view peer 0 has of peer 1's ctr in peerCtrs[1]
                 writePeerCtrs[1] = readPeerCtrs[1];
               }
