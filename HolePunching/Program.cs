@@ -1,6 +1,8 @@
 ﻿using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
+using System.Reflection.Metadata;
+using System.Runtime.InteropServices.Marshalling;
 using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
 
@@ -45,13 +47,15 @@ enum SynAckState : byte
 
 abstract class SynAckStateMachineBase
 {
+  private static readonly byte[] BULLET_PACKET = System.Text.Encoding.ASCII.GetBytes("H");
+
   // borrowed socket from HolePunchingStateMachine. DO NOT DISPOSE
   protected readonly Socket _udpSocket;
   protected EndPoint _peerEndPoint;
   protected readonly ILogger? _logger;
 
   protected readonly byte[] _internalRecvBuffer = new byte[32];
-  protected readonly byte[] _internalSendBuffer = new byte[2];
+  protected readonly byte[] _internalSendBuffer = new byte[32];
 
   protected SynAckState _currentState = SynAckState.Initial;
   public SynAckState CurrentState => _currentState;
@@ -70,14 +74,29 @@ abstract class SynAckStateMachineBase
     _logger = logger;
   }
 
-  public abstract void Next();
+  // As long as the state machine is kept active we actually want to keep sending bullets
+  public void Next()
+  {
+    SendBullets();
+    NextImpl();
+  }
+
+  public abstract void NextImpl();
+
+  private void SendBullets() 
+  {
+    for (int i = 0; i < 5; i++)
+    {
+      _udpSocket.SendTo(BULLET_PACKET, _peerEndPoint);
+    }
+  }
 }
 
 class SynAckStateMachineInitiator : SynAckStateMachineBase
 {
   public SynAckStateMachineInitiator(Socket udpSocket, EndPoint peerEndPoint, ILogger? logger) : base(udpSocket, peerEndPoint, logger) { }
 
-  public override void Next()
+  public override void NextImpl()
   {
     switch (_currentState)
     {
@@ -190,7 +209,7 @@ class SynAckStateMachineResponder : SynAckStateMachineBase
 {
   public SynAckStateMachineResponder(Socket udpSocket, EndPoint peerEndPoint, ILogger? logger) : base(udpSocket, peerEndPoint, logger) { }
 
-  public override void Next()
+  public override void NextImpl()
   {
     int read;
     switch (_currentState)
@@ -384,6 +403,8 @@ internal class HolePunchingStateMachine : IAsyncDisposable
     "stun4.l.google.com:19302",
   };
 
+  private static readonly byte[] BULLET_PACKET = System.Text.Encoding.ASCII.GetBytes("H");
+
   // Session lifetime for registration with server, after these minutes the server will evict our registration
   // this will not impact active connections but will require re-registration for future connections
   private const int SESSION_LIFETIME_MINS = 10;
@@ -394,6 +415,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   private readonly string _selfId;
   private readonly int _maxRetryCount;
   private readonly ILogger? _logger;
+
 
   // State - Mutable fields 
   private bool _isSelfA;
@@ -570,17 +592,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           break;
         }
 
-        /* 
-          Hole punching Core Synchronization Logic:
-          A is the initiator and B is the responder
-
-          A will send syn packets to B
-          B upon recieval will send syn-ack packets to A
-          A upon recieval will send ack packets to B
-          B will transition to established upon recieving ack from A
-          A will transition to established upon sending ack to B
-        */
-
         _logger?.LogDebug("HolePunching: Attempting hole punching synchronization with peer at {PeerEndPoint}", _peerEndPoint);
 
         bool connected = false;
@@ -590,7 +601,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           SynAckStateMachineBase stateMachine = _isSelfA ? new SynAckStateMachineInitiator(_udpSocket, _peerEndPoint, _logger) : new SynAckStateMachineResponder(_udpSocket, _peerEndPoint, _logger);
           SynAckState prevState = stateMachine.CurrentState;
           for (; stateMachine.CurrentState != SynAckState.Established;)
-          {
+          { 
             stateMachine.Next();
             // no state change. this could be due to timeouts waiting for packets etc
             if (stateMachine.CurrentState == prevState)
@@ -598,7 +609,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
               continue;
             }
 
-            _logger?.LogDebug("HolePunching: Initiator State Machine Transition: {PrevState} => {CurrentState}", prevState, stateMachine.CurrentState);
+            _logger?.LogDebug("HolePunching: State Machine Transition: {PrevState} => {CurrentState}", prevState, stateMachine.CurrentState);
             prevState = stateMachine.CurrentState;
           }
           connected = true;
