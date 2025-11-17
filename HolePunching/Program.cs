@@ -179,11 +179,10 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           break;
         }
 
-        _logger?.LogDebug("HolePunching: NAT is not symmetric, proceeding with hole punching");
-
         // get which is the port the above socket is bound to externally via NAT using STUN
         (IPAddress publicIp, int ephemeralPort) = await MinimalStunClient.GetStunPortAsync(_udpSocket, STUN_SERVERS);
 
+        _logger?.LogDebug("HolePunching: Discovered public IP {PublicIP} and port {PublicPort} via STUN", publicIp, ephemeralPort);
         await RegisterWithServerAsync(publicIp, ephemeralPort); // Let any failure in registration propagate up, redis stack exchange client should have already retried internally if needed
 
         CurrentState = HolePunchingState.RegisteredWithServer;
