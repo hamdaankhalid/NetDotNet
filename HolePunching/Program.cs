@@ -279,12 +279,11 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           _udpSocket.SendTo(writePeerCtrs, SocketFlags.None, _peerEndPoint);
 
           // observe incoming ctr updates
-          if (_udpSocket.Poll(250_000, SelectMode.SelectRead)) // microseconds - 250ms between sends
+          if (_udpSocket.Poll(100_000, SelectMode.SelectRead)) // microseconds - 250ms between sends
           {
             int receiveResult = _udpSocket.ReceiveFrom(readPeerCtrs, SocketFlags.None, ref tempEndPoint);
             if (receiveResult > 0)
             {
-
               if (_isSelfA)
               {
                 // put whatever view peer 1 has of peer 0's ctr in peerCtrs[0]
@@ -299,9 +298,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
                 // put whatever view peer 0 has of peer 1's ctr in peerCtrs[1]
                 writePeerCtrs[1] = readPeerCtrs[1];
               }
-
-              readPeerCtrs[0] = 0; // reset for next receive
-              readPeerCtrs[1] = 0; // reset for next receive
             }
           }
         }
