@@ -263,6 +263,16 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         _udpSocket.ReceiveTimeout = 250;
         for (int i = 0; i < maxAttempts; i++)
         {
+
+          // Both reads indicate that both peers have seen each other at least once
+          // we compare all to 1 since we are just setting to 1 to indicate receipt of packet
+          // and reads and local state must be in sync according to the protocol
+          if (readPeerCtrs[0] == 1 && readPeerCtrs[1] == 1 && writePeerCtrs[0] == 1 && writePeerCtrs[1] == 1)
+          {
+            connected = true;
+            break;
+          }
+
           _logger?.LogDebug("Hole Punching Protocol Ack-Syn Ack State peerA: {}, peerB: {}", writePeerCtrs[0], writePeerCtrs[1]);
 
           // send local view of ctrs
@@ -274,14 +284,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
             int receiveResult = _udpSocket.ReceiveFrom(readPeerCtrs, SocketFlags.None, ref tempEndPoint);
             if (receiveResult > 0)
             {
-              // Both reads indicate that both peers have seen each other at least once
-              // we compare all to 1 since we are just setting to 1 to indicate receipt of packet
-              // and reads and local state must be in sync according to the protocol
-              if (readPeerCtrs[0] == 1 && readPeerCtrs[1] == 1 && writePeerCtrs[0] == 1 && writePeerCtrs[1] == 1)
-              {
-                connected = true;
-                break;
-              }
 
               if (_isSelfA)
               {
