@@ -60,7 +60,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   // Session lifetime for registration with server, after these minutes the server will evict our registration
   // this will not impact active connections but will require re-registration for future connections
   private const int SESSION_LIFETIME_MINS = 10;
-  private const int TIMEOUT_SECS = 5;
+  private const int TIMEOUT_SECS = 15;
 
   // Non-static fields
   private readonly IConnectionMultiplexer _connectionMultiplexer;
@@ -251,76 +251,61 @@ internal class HolePunchingStateMachine : IAsyncDisposable
 
         /* 
           Hole punching Core Synchronization Logic:
-          Each peer maintains: [mySendCtr, myRecvCtr]
-          - mySendCtr: increments each time I send a packet
-          - myRecvCtr: increments each time I receive a packet
-          
-          Connection established when both:
-          1. I've sent at least 1 packet (mySendCtr >= 1)
-          2. I've received at least 1 packet (myRecvCtr >= 1)
-          3. Peer has sent at least 1 packet (observed via their mySendCtr in received packet)
-          4. Peer has received at least 1 packet (observed via their myRecvCtr in received packet)
-          
-          This ensures bidirectional communication is working.
+          Initially they are both sending (0, 0) and (0, 0)
+          When a peer recieves a packet from the other peer it updates its view of the other peer's counter and increments its own counter to indicate receipt
+          the peer updates the view of the other peer's counter in the position corresponding to the other peer indicating that it has received a packet from them
+          (1, 0) is sent by peer A to indicate it has received a packet from peer B
+          (0, 1) is sent by peer B to indicate it has received a packet from peer A
+
+          Once both have recieved (1, 1) we will wait for (2,2)
         */
 
         _logger?.LogDebug("HolePunching: Attempting hole punching synchronization with peer at {PeerEndPoint}", _peerEndPoint);
 
-        byte mySendCtr = 0;
-        byte myRecvCtr = 0;
-        byte peerSendCtr = 0;  // Observed from peer's packets
-        byte peerRecvCtr = 0;  // Observed from peer's packets
-        
-        byte[] sendBuf = new byte[2];
-        byte[] recvBuf = new byte[2];
+        // 0 says no packets received yet, 1 says at least one packet received
+        byte[] readPeerCtrs = new byte[2];
+        byte[] writePeerCtrs = new byte[2];
 
         int maxAttempts = TIMEOUT_SECS * 4;
-        EndPoint tempEndPoint = _peerEndPoint;
+        EndPoint tempEndPoint = _peerEndPoint; // only need to do this so I can pass it by ref
         bool connected = false;
         _udpSocket.ReceiveTimeout = 250;
-        
         for (int i = 0; i < maxAttempts; i++)
         {
-          // Check if bidirectional communication is established
-          bool iCanSend = mySendCtr > 0;
-          bool iCanReceive = myRecvCtr > 0;
-          bool peerCanSend = peerSendCtr > 0;
-          bool peerCanReceive = peerRecvCtr > 0;
-          
-          if (iCanSend && iCanReceive && peerCanSend && peerCanReceive)
+          _logger?.LogDebug("Ack-Syn State WRITE BUF peerA: {}, peerB: {}", writePeerCtrs[0], writePeerCtrs[1]);
+          _logger?.LogDebug("Ack-Syn State READ BUF peerA: {}, peerB: {}", readPeerCtrs[0], readPeerCtrs[1]);
+
+          if (readPeerCtrs[0] == 1 && readPeerCtrs[1] == 1 && writePeerCtrs[0] == 1 && writePeerCtrs[1] == 1)
           {
-            _logger?.LogDebug("HolePunching: Bidirectional communication verified! My:[S:{MySendCtr},R:{MyRecvCtr}] Peer:[S:{PeerSendCtr},R:{PeerRecvCtr}]",
-              mySendCtr, myRecvCtr, peerSendCtr, peerRecvCtr);
             connected = true;
             break;
           }
 
-          // Prepare packet: [mySendCtr, myRecvCtr]
-          sendBuf[0] = mySendCtr;
-          sendBuf[1] = myRecvCtr;
-          
-          // Send our current state
-          _udpSocket.SendTo(sendBuf, SocketFlags.None, _peerEndPoint);
-          mySendCtr++; // Increment after sending
-          
-          if ((i + 1) % 10 == 0)
-          {
-            _logger?.LogDebug("HolePunching: Attempt {Attempt}/{MaxAttempts} - My:[S:{MySendCtr},R:{MyRecvCtr}] Peer:[S:{PeerSendCtr},R:{PeerRecvCtr}]",
-              i + 1, maxAttempts, mySendCtr, myRecvCtr, peerSendCtr, peerRecvCtr);
-          }
+          Array.Fill(readPeerCtrs, (byte)0);
 
-          // Try to receive peer's state
-          if (_udpSocket.Poll(250_000, SelectMode.SelectRead)) // 250ms poll
+          // send local view of ctrs
+          _udpSocket.SendTo(writePeerCtrs, SocketFlags.None, _peerEndPoint);
+
+          // observe incoming ctr updates
+          if (_udpSocket.Poll(250_000, SelectMode.SelectRead)) // microseconds - 250ms between sends
           {
-            Array.Fill(recvBuf, (byte)0);
-            int receiveResult = _udpSocket.ReceiveFrom(recvBuf, SocketFlags.None, ref tempEndPoint);
-            
-            if (receiveResult >= 2)
+            int receiveResult = _udpSocket.ReceiveFrom(readPeerCtrs, SocketFlags.None, ref tempEndPoint);
+            if (receiveResult > 0)
             {
-              // Update our view of peer's counters
-              peerSendCtr = recvBuf[0];  // Peer's send counter
-              peerRecvCtr = recvBuf[1];  // Peer's receive counter
-              myRecvCtr++; // We received a packet
+              if (_isSelfA)
+              {
+                // put whatever view peer 1 has of peer 0's ctr in peerCtrs[0]
+                writePeerCtrs[0] = readPeerCtrs[0];
+                // Tell peer 1 that peer 0 has recvd the packet by setting to 1. This might worth using incrementing peerCtrs[1]
+                writePeerCtrs[1] = 1;
+              }
+              else
+              {
+                // Tell peer 0 that peer 1 has recvd the packet by setting to 1. This might worth using incrementing peerCtrs[0]
+                writePeerCtrs[0] = 1;
+                // put whatever view peer 0 has of peer 1's ctr in peerCtrs[1]
+                writePeerCtrs[1] = readPeerCtrs[1];
+              }
             }
           }
         }
