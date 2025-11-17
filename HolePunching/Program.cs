@@ -296,25 +296,26 @@ internal class HolePunchingStateMachine : IAsyncDisposable
             {
               // check if our randbyte is in circulation or theirs
               bool isOurRandByteUsed = _isSelfA ? readPeerCtrs[1] == randByte : readPeerCtrs[0] == randByte;
-              if (!isOurRandByteUsed)
+              byte randByteRcvd = _isSelfA ? readPeerCtrs[1] : readPeerCtrs[0];
+
+              if (!isOurRandByteUsed && randByteRcvd != 0)
               {
-                randByte = _isSelfA ? readPeerCtrs[1] : readPeerCtrs[0];
                 _logger?.LogDebug("HolePunching: Updated randByte to {RandByte} based on peer response", randByte);
               }
 
               if (_isSelfA)
               {
-                // put whatever view peer 1 has of peer 0's ctr in peerCtrs[0]
-                writePeerCtrs[0] = readPeerCtrs[0];
-                // Tell peer 1 that peer 0 has recvd the packet by setting to 1. This might worth using incrementing peerCtrs[1]
-                writePeerCtrs[1] = randByte;
-              }
-              else
-              {
                 // Tell peer 0 that peer 1 has recvd the packet by setting to 1. This might worth using incrementing peerCtrs[0]
                 writePeerCtrs[0] = randByte;
                 // put whatever view peer 0 has of peer 1's ctr in peerCtrs[1]
                 writePeerCtrs[1] = readPeerCtrs[1];
+              }
+              else
+              {
+                // put whatever view peer 1 has of peer 0's ctr in peerCtrs[0]
+                writePeerCtrs[0] = readPeerCtrs[0];
+                // Tell peer 1 that peer 0 has recvd the packet by setting to 1. This might worth using incrementing peerCtrs[1]
+                writePeerCtrs[1] = randByte;
               }
             }
           }
