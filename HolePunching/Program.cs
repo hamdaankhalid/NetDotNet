@@ -249,57 +249,78 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           break;
         }
 
-        // Hole punching Core Synchronization Logic:
+        /* 
+          Hole punching Core Synchronization Logic:
+          Each peer maintains: [mySendCtr, myRecvCtr]
+          - mySendCtr: increments each time I send a packet
+          - myRecvCtr: increments each time I receive a packet
+          
+          Connection established when both:
+          1. I've sent at least 1 packet (mySendCtr >= 1)
+          2. I've received at least 1 packet (myRecvCtr >= 1)
+          3. Peer has sent at least 1 packet (observed via their mySendCtr in received packet)
+          4. Peer has received at least 1 packet (observed via their myRecvCtr in received packet)
+          
+          This ensures bidirectional communication is working.
+        */
 
         _logger?.LogDebug("HolePunching: Attempting hole punching synchronization with peer at {PeerEndPoint}", _peerEndPoint);
 
-        byte[] readPeerCtrs = new byte[2];
-        byte[] writePeerCtrs = new byte[2]; // 0 cts at first
+        byte mySendCtr = 0;
+        byte myRecvCtr = 0;
+        byte peerSendCtr = 0;  // Observed from peer's packets
+        byte peerRecvCtr = 0;  // Observed from peer's packets
+        
+        byte[] sendBuf = new byte[2];
+        byte[] recvBuf = new byte[2];
 
         int maxAttempts = TIMEOUT_SECS * 4;
-        EndPoint tempEndPoint = _peerEndPoint; // only need to do this so I can pass it by ref
+        EndPoint tempEndPoint = _peerEndPoint;
         bool connected = false;
         _udpSocket.ReceiveTimeout = 250;
+        
         for (int i = 0; i < maxAttempts; i++)
         {
-
-          _logger?.LogDebug("Ack-Syn State WRITE BUF peerA: {}, peerB: {}", writePeerCtrs[0], writePeerCtrs[1]);
-          _logger?.LogDebug("Ack-Syn State READ BUF peerA: {}, peerB: {}", readPeerCtrs[0], readPeerCtrs[1]);
-
-          // Both reads indicate that both peers have seen each other at least once
-          // we compare all to 1 since we are just setting to 1 to indicate receipt of packet
-          // and reads and local state must be in sync according to the protocol
-          if (readPeerCtrs[0] == 1 && readPeerCtrs[1] == 1 && writePeerCtrs[0] == 1 && writePeerCtrs[1] == 1)
+          // Check if bidirectional communication is established
+          bool iCanSend = mySendCtr > 0;
+          bool iCanReceive = myRecvCtr > 0;
+          bool peerCanSend = peerSendCtr > 0;
+          bool peerCanReceive = peerRecvCtr > 0;
+          
+          if (iCanSend && iCanReceive && peerCanSend && peerCanReceive)
           {
+            _logger?.LogDebug("HolePunching: Bidirectional communication verified! My:[S:{MySendCtr},R:{MyRecvCtr}] Peer:[S:{PeerSendCtr},R:{PeerRecvCtr}]",
+              mySendCtr, myRecvCtr, peerSendCtr, peerRecvCtr);
             connected = true;
             break;
           }
 
-          Array.Fill(readPeerCtrs, (byte)0);
-
-          // send local view of ctrs
-          _udpSocket.SendTo(writePeerCtrs, SocketFlags.None, _peerEndPoint);
-
-          // observe incoming ctr updates
-          if (_udpSocket.Poll(100_000, SelectMode.SelectRead)) // microseconds - 250ms between sends
+          // Prepare packet: [mySendCtr, myRecvCtr]
+          sendBuf[0] = mySendCtr;
+          sendBuf[1] = myRecvCtr;
+          
+          // Send our current state
+          _udpSocket.SendTo(sendBuf, SocketFlags.None, _peerEndPoint);
+          mySendCtr++; // Increment after sending
+          
+          if ((i + 1) % 10 == 0)
           {
-            int receiveResult = _udpSocket.ReceiveFrom(readPeerCtrs, SocketFlags.None, ref tempEndPoint);
-            if (receiveResult > 0)
+            _logger?.LogDebug("HolePunching: Attempt {Attempt}/{MaxAttempts} - My:[S:{MySendCtr},R:{MyRecvCtr}] Peer:[S:{PeerSendCtr},R:{PeerRecvCtr}]",
+              i + 1, maxAttempts, mySendCtr, myRecvCtr, peerSendCtr, peerRecvCtr);
+          }
+
+          // Try to receive peer's state
+          if (_udpSocket.Poll(250_000, SelectMode.SelectRead)) // 250ms poll
+          {
+            Array.Fill(recvBuf, (byte)0);
+            int receiveResult = _udpSocket.ReceiveFrom(recvBuf, SocketFlags.None, ref tempEndPoint);
+            
+            if (receiveResult >= 2)
             {
-              if (_isSelfA)
-              {
-                // put whatever view peer 1 has of peer 0's ctr in peerCtrs[0]
-                writePeerCtrs[0] = readPeerCtrs[0];
-                // Tell peer 1 that peer 0 has recvd the packet by setting to 1. This might worth using incrementing peerCtrs[1]
-                writePeerCtrs[1] = 1;
-              }
-              else
-              {
-                // Tell peer 0 that peer 1 has recvd the packet by setting to 1. This might worth using incrementing peerCtrs[0]
-                writePeerCtrs[0] = 1;
-                // put whatever view peer 0 has of peer 1's ctr in peerCtrs[1]
-                writePeerCtrs[1] = readPeerCtrs[1];
-              }
+              // Update our view of peer's counters
+              peerSendCtr = recvBuf[0];  // Peer's send counter
+              peerRecvCtr = recvBuf[1];  // Peer's receive counter
+              myRecvCtr++; // We received a packet
             }
           }
         }
