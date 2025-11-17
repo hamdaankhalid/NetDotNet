@@ -51,6 +51,7 @@ abstract class SynAckStateMachineBase
   protected readonly ILogger? _logger;
 
   protected readonly byte[] _internalRecvBuffer = new byte[32];
+  protected readonly byte[] _internalSendBuffer = new byte[2];
 
   protected SynAckState _currentState = SynAckState.Initial;
   public SynAckState CurrentState => _currentState;
@@ -89,8 +90,9 @@ class SynAckStateMachineInitiator : SynAckStateMachineBase
         
         // Send SYN packets with sequence number
         _mySeq++;
-        byte[] synPacket = new byte[] { (byte)SynAckState.Syn, _mySeq };
-        _udpSocket.SendTo(synPacket, SocketFlags.None, _peerEndPoint);
+        _internalSendBuffer[0] = (byte)SynAckState.Syn;
+        _internalSendBuffer[1] = _mySeq;
+        _udpSocket.SendTo(_internalSendBuffer, SocketFlags.None, _peerEndPoint);
         _logger?.LogDebug("SynAck Initiator: Sent SYN seq={Seq} (attempt {Attempt})", _mySeq, _attemptCount + 1);
         _attemptCount++;
         _currentState = SynAckState.Syn;
@@ -141,8 +143,9 @@ class SynAckStateMachineInitiator : SynAckStateMachineBase
       case SynAckState.SynAck:
         // Send ACK packet with sequence number
         _mySeq++;
-        byte[] ackPacket = new byte[] { (byte)SynAckState.Ack, _mySeq };
-        _udpSocket.SendTo(ackPacket, SocketFlags.None, _peerEndPoint);
+        _internalSendBuffer[0] = (byte)SynAckState.Ack;
+        _internalSendBuffer[1] = _mySeq;
+        _udpSocket.SendTo(_internalSendBuffer, SocketFlags.None, _peerEndPoint);
         _logger?.LogDebug("SynAck Initiator: Sent ACK seq={Seq}", _mySeq);
         _currentState = SynAckState.Ack;
         break;
@@ -247,8 +250,9 @@ class SynAckStateMachineResponder : SynAckStateMachineBase
       case SynAckState.Syn:
         // Send SYN-ACK packet with sequence number
         _mySeq++;
-        byte[] synAckPacket = new byte[] { (byte)SynAckState.SynAck, _mySeq };
-        _udpSocket.SendTo(synAckPacket, SocketFlags.None, _peerEndPoint);
+        _internalSendBuffer[0] = (byte)SynAckState.SynAck;
+        _internalSendBuffer[1] = _mySeq;
+        _udpSocket.SendTo(_internalSendBuffer, SocketFlags.None, _peerEndPoint);
         _logger?.LogDebug("SynAck Responder: Sent SYN-ACK seq={Seq}", _mySeq);
         _currentState = SynAckState.SynAck;
         break;
