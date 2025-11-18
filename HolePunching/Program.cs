@@ -63,6 +63,7 @@ class HandshakeStateMachine
   private readonly ILogger? _logger;
   private readonly byte[] _internalRecvBuffer = new byte[33]; // divisible by 3 right now, should add byte packing in future
   private readonly byte[] _internalSendBuffer = new byte[3];
+  private readonly bool _isA;
 
   // Non-readonly fields
   private ProtocolState _currentState = ProtocolState.INITIAL;
@@ -82,6 +83,7 @@ class HandshakeStateMachine
     _logger = logger;
     _mySessionId = sessionId;
     _connectionMultiplexer = connectionMultiplexer;
+    _isA = selfId.CompareTo(peerId) < 0; // just a way to deterministically decide roles and
 
     // create and store the strings so as to not have to create per calll
     _mySessionStateStoreKey = $"{STATE_STORE_KEY_PREFIX}/{selfId}/{peerId}"; // I can ONLY write to this
@@ -126,7 +128,7 @@ class HandshakeStateMachine
         {
           // if the recvd bullets are from the same session who has posted state, that same session must be live right now, and if the live session can confirm that it sees us!
           // we can establish that a bidirectionally viewable UDP channel has been established.
-          if (gotPeerBullets && TryReadPeerView(out short peerSessionId, out byte ourSessionIdViewedByPeer))
+          if (gotPeerBullets && TryReadPeerView(out byte peerSessionId, out byte ourSessionIdViewedByPeer))
           {
             _logger?.LogDebug("HandshakeStateMachine: Read peer view from state store PeerSessionId: {PeerSessionId}, {PeersViewOfOurSessionId}",
               peerSessionId, ourSessionIdViewedByPeer);
@@ -162,15 +164,22 @@ class HandshakeStateMachine
   private void PublishViewToPeer()
   {
     // what is my session id, what is the session Id I saw of peers
-    short view = (short)((_mySessionId << 8) | _peerSessionId); // my sessionId sits high, peer sessionId low
+    // A writes their session ID high, B writes their session ID low
+    short view;
+    if (_isA)
+    {
+      view = (short)((_mySessionId << 8) | _peerSessionId);
+    }
+    else
+    {
+      view = (short)((_peerSessionId << 8) | _mySessionId);
+    }
+
     IDatabase db = _connectionMultiplexer.GetDatabase();
-    // Redis doesn't have a native short type - it stores values as strings or byte arrays
-    // StackExchange.Redis can serialize ints, longs, strings, etc. but not short directly
-    // We need to cast to int or use byte array serialization
     db.Execute("SET", _mySessionStateStoreKey, (int)view);
   }
 
-  private bool TryReadPeerView(out short peerSessionId, out byte ourSessionIdViewedByPeer)
+  private bool TryReadPeerView(out byte peerSessionId, out byte ourSessionIdViewedByPeer)
   {
     peerSessionId = 0;
     ourSessionIdViewedByPeer = 0;
@@ -181,8 +190,18 @@ class HandshakeStateMachine
       return false;
     }
     short stateInt = (short)res;
-    peerSessionId = (short)((stateInt >> 8) & 0xFF);
-    ourSessionIdViewedByPeer = (byte)(stateInt & 0xFF);
+    if (_isA)
+    {
+      peerSessionId = (byte)((stateInt >> 8) & 0xFF);
+      ourSessionIdViewedByPeer = (byte)(stateInt & 0xFF);
+    }
+    // low bits belong to peerB
+    else
+    {
+      ourSessionIdViewedByPeer = (byte)((stateInt >> 8) & 0xFF);
+      peerSessionId = (byte)(stateInt & 0xFF);
+    }
+
     return true;
   }
 
