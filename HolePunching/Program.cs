@@ -99,7 +99,7 @@ class HandshakeStateMachine
     // read penetration bullets
     bool gotPeerBullets = TryReadNatPenetrationBullets();
     // we have seen peer's udp messages get in via UDP. It then publishes to state store that it sees peer at this session
-    _logger?.LogDebug("HandshakeStateMachine: Publishing view to peer {mySessionId} {peerSessionId}", _mySessionId, _peerSessionId);
+    _logger?.LogDebug("HandshakeStateMachine: Publishing {isA} view to peer {mySessionId} {peerSessionId}", _isA ? "A" : "B", _mySessionId, _peerSessionId);
 
     PublishViewToPeer();
 
@@ -192,14 +192,14 @@ class HandshakeStateMachine
     short stateInt = (short)res;
     if (_isA)
     {
-      peerSessionId = (byte)((stateInt >> 8) & 0xFF);
-      ourSessionIdViewedByPeer = (byte)(stateInt & 0xFF);
+      ourSessionIdViewedByPeer = (byte)((stateInt >> 8) & 0xFF);
+      peerSessionId = (byte)(stateInt & 0xFF);
     }
     // low bits belong to peerB
     else
     {
-      ourSessionIdViewedByPeer = (byte)((stateInt >> 8) & 0xFF);
-      peerSessionId = (byte)(stateInt & 0xFF);
+      peerSessionId = (byte)((stateInt >> 8) & 0xFF);
+      ourSessionIdViewedByPeer = (byte)(stateInt & 0xFF);
     }
 
     return true;
