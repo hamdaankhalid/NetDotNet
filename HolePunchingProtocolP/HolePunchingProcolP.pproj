@@ -1,0 +1,10 @@
+<!-- P project file for the Two Phase Commit example -->
+<Project>
+<ProjectName>HolePunchingProtocolP</ProjectName>
+<InputFiles>
+    <PFile>./PSrc/</PFile>
+    <PFile>./PSpec/</PFile>
+    <PFile>./PTst/</PFile>
+</InputFiles>
+<OutputDir>./PGenerated/</OutputDir>
+</Project>
