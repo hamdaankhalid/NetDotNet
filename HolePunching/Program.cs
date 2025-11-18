@@ -62,7 +62,7 @@ class HandshakeStateMachine
   private readonly EndPoint _peerEndPoint;
   private readonly ILogger? _logger;
   private readonly byte[] _internalRecvBuffer = new byte[33]; // divisible by 3 right now, should add byte packing in future
-  private readonly byte[] _internalSendBuffer = new byte[32];
+  private readonly byte[] _internalSendBuffer = new byte[3];
 
   // Non-readonly fields
   private ProtocolState _currentState = ProtocolState.INITIAL;
