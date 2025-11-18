@@ -48,7 +48,7 @@ enum ProtocolState : byte
 
 class HandshakeStateMachine
 {
-  private const int MAX_ATTEMPTS = 40; // ~5 seconds with 250ms polls
+  private const int MAX_ATTEMPTS = 200; // ~5 seconds with 250ms polls
   private static string STATE_STORE_KEY_PREFIX = "HolePunching:SynAckStateMachine:";
 
   // borrowed socket from HolePunchingStateMachine. DO NOT DISPOSE
@@ -256,7 +256,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   // Session lifetime for registration with server, after these minutes the server will evict our registration
   // this will not impact active connections but will require re-registration for future connections
   private const int SESSION_LIFETIME_MINS = 10;
-  private const int TIMEOUT_SECS = 15;
 
   // Non-static fields
   private readonly IConnectionMultiplexer _connectionMultiplexer;
@@ -266,7 +265,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
 
 
   // State - Mutable fields 
-  private bool _isSelfA;
   private int _registrationRetryCount;
   private int _sendPunchRetryCount;
   private IPAddress? _peerIp;
@@ -416,8 +414,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           break;
         }
 
-        _isSelfA = String.CompareOrdinal(_selfId, _peerId) < 0; // Assign roles based on lexicographical order of IDs
-
         // peer we want to connect to has also registered, parse their info
         _registrationRetryCount = 0;
         string[] peerParts = peerInfo.Split(':');
@@ -513,7 +509,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         _peerIp = null;
         _peerPort = 0;
         _peerEndPoint = null!;
-        _isSelfA = false;
 
         CurrentState = HolePunchingState.INITIAL;
         break;
@@ -640,7 +635,7 @@ public sealed class HOPPeer : IAsyncDisposable
 
   public HOPPeer(string discoverableId, string registrationServerAddr, ILogger? logger = null)
   {
-    _stateMachine = new HolePunchingStateMachine(discoverableId, registrationServerAddr, maxRetryCount: 5, logger: logger);
+    _stateMachine = new HolePunchingStateMachine(discoverableId, registrationServerAddr, maxRetryCount: 200, logger: logger);
   }
 
   public async Task<bool> ConnectAsync(string peerId)
