@@ -1,22 +1,14 @@
-Problem 1 in this model is that we would need to detect who is "intiator" and who is "listener"
-Syn           -> 
-              <-  Syn-Ack
-Ack           ->
-              <- Established
-Established
+State machines doing connection handshake use a store to publish information such that we know for sure it is reachable by another peer.
 
-Problem 2 is that we need both to be sending messages and we can't stop till both can send the data
+The semantics we want is that A says I can see you B, and waits till B says I can see you A
+Then both can upgrade their states to established
 
-In syn ack model we have an initiator and a responder, but this won't work for opening the NAT hole
+A upon recieving B's packets updates the state store saying B I see you at this sessionID X, with my sessionID as Y.
+Now it must wait for B to say I see you with this sessionID J, and my sessionID K.
 
-What if both sides open holes and are sending punch packets
+If X == K AND Y == J then the session was established for the 2 same peers that are online right now.
+this should prevent a situation where A could see B at a previous version say Y, then times out and while B has not timed out (it's version remains the same), B thinks A has been seen seen before even though this a brand new connection start by A that might not have penetrated the NAT.
 
-Now the issue is to understand how do we know if we can stop
+The session that penetrated the NAT must be the one seen by both parties.
 
-After 5 seconds of sending packets maybe we can do our syn-ack-synack phase to make sure that atleast one recv was recvd in that 5 seconds
-if not keep trying.
-In the above case the issue is that 
-
-Why do syn-ack-synack after 5 second spam based filtering? can every control packet be sent with some level of session identificaiton
-
-Maybe I can do ignored pings as a background thread job?
+NAT bullets must therefore be sending session Ids.

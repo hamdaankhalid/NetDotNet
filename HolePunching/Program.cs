@@ -1,11 +1,8 @@
 ﻿using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
-using System.Reflection.Metadata.Ecma335;
 using Microsoft.Extensions.Logging;
 using StackExchange.Redis;
-
-# region Protocol Implementation
 
 /* UDP Hole punching client
 Technique to enable direct communication between two clients behind NATs by using a third-party server to coordinate the connection.
@@ -33,280 +30,215 @@ and thus without any listening sockets you have peer to peer communication.
 
 
 # region AckSyn State Machine
-// State machine to manage the SYN, SYN-ACK, ACK handshake for hole punching over UDP. It is not exactly how TCP does it, but I just want it to work
-enum SynAckState : byte
+// State machine to manage the handshake for hole punching over UDP.
+// It uses Garnet/Redis as the reliable delivery mechanism to exchange control messages between peers to coordinate the hole punching process
+// once it is clear that both peers have an open state, we know that connection has been established!
+// We basically use UDP only for keep-alive bullets to maintain NAT mappings
+// We need something that gives us ATLEAST once delivery semantics. De-dupe will make it exactly once.
+// The core problem is that we need to be able to say I see your messages, and the peer needs to be able to say I see your messages too.
+// Only when both sides can confirm can we move to a fully established state
+
+enum ProtocolState : byte
 {
-  None = 0,
-  // No packets received yet
-  Initial,
-  Syn,
-  SynAck,
-  Ack,
-  Established,
-  Bullet,
+  INITIAL, // we have not yet seen any peer state
+  SEEN_PEER_STATE, // this is reached when it sees peer's udp messages get in via UDP. It then publishes to state store that it sees peer at this session
+  WAITING_TO_ESTABLISH, // polls state store for peer seeing our state, and confirms we also saw their state in the most recent session id published by them
+  ESTABLISHED_CONNECTION
 }
 
-abstract class SynAckStateMachineBase
+class HandshakeStateMachine
 {
+  private const int MAX_ATTEMPTS = 40; // ~5 seconds with 250ms polls
+  private static string STATE_STORE_KEY_PREFIX = "HolePunching:SynAckStateMachine:";
+
   // borrowed socket from HolePunchingStateMachine. DO NOT DISPOSE
-  protected readonly Socket _udpSocket;
-  protected EndPoint _peerEndPoint;
-  protected readonly ILogger? _logger;
+  private readonly Socket _udpSocket;
+  private readonly byte _mySessionId;
 
-  protected readonly byte[] _internalRecvBuffer = new byte[32];
-  protected readonly byte[] _internalSendBuffer = new byte[32];
+  // borrowed conn mux, DO NOT DISPOSE
+  private readonly IConnectionMultiplexer _connectionMultiplexer;
+  private readonly string _mySessionStateStoreKey;
+  private readonly string _peerSessionStateStoreKey;
+  private readonly EndPoint _peerEndPoint;
+  private readonly ILogger? _logger;
+  private readonly byte[] _internalRecvBuffer = new byte[33]; // divisible by 3 right now, should add byte packing in future
+  private readonly byte[] _internalSendBuffer = new byte[32];
 
-  protected SynAckState _currentState = SynAckState.Initial;
-  public SynAckState CurrentState => _currentState;
+  // Non-readonly fields
+  private ProtocolState _currentState = ProtocolState.INITIAL;
+  private int _attemptCount = 0;
 
-  protected int _attemptCount = 0;
-  protected const int MAX_ATTEMPTS = 40; // ~5 seconds with 250ms polls
+  // Sequence numbers for detecting duplicates and old packets (de-dupe and ordering)
+  private byte _peerSessionId = 0; // peer session id is mutable since if peer session id changes we need to rollback our state machine to match with theirs
+  private byte _mySeq;
+  private byte _peerSeq;
 
-  // Sequence numbers for detecting duplicates and old packets
-  protected byte _mySeq = 0;      // Sequence number I send
-  protected byte _lastPeerSeq = 0; // Last sequence number received from peer
+  public ProtocolState CurrentState => _currentState;
 
-  public SynAckStateMachineBase(Socket udpSocket, EndPoint peerEndPoint, ILogger? logger, ref byte startingSeq)
+  public HandshakeStateMachine(string selfId, string peerId, byte sessionId, Socket udpSocket, EndPoint peerEndPoint, ILogger? logger, IConnectionMultiplexer connectionMultiplexer)
   {
     _udpSocket = udpSocket;
     _peerEndPoint = peerEndPoint;
     _logger = logger;
-    _mySeq = startingSeq;
-  }
+    _mySessionId = sessionId;
+    _connectionMultiplexer = connectionMultiplexer;
 
-  // Each impl of statemachine defines this, that is hooked into by the overarching state machine base class
-  public abstract void NextImpl();
+    // create and store the strings so as to not have to create per calll
+    _mySessionStateStoreKey = $"{STATE_STORE_KEY_PREFIX}/{selfId}/{peerId}"; // I can ONLY write to this
+    _peerSessionStateStoreKey = $"{STATE_STORE_KEY_PREFIX}/{peerId}/{selfId}"; // I can ONLY read from this. This read write separation means no concurrent write data races can occur
+  }
 
   // As long as the state machine is kept active we actually want to keep sending bullets
   public void Next()
   {
-      _internalSendBuffer[0] = (byte)SynAckState.Bullet;
-      _internalSendBuffer[1] = 0; // the sequence number doesn't matter in Bullet packets
-    for (int i = 0; i < 10; i++) // 10 bullets per state?
+    // state machines should use the backing store for reliable delivery of state messages not UDP
+    // UDP is only kept for hole punching keep-alive bullets, only once the established state is reached should UDP be used for actual data transfer
+    ShootNatPenetrationBullets(3); // 3 bullets per state call to keep NAT mappings alive
+    // read penetration bullets
+    bool gotPeerBullets = TryReadNatPenetrationBullets();
+
+    switch (_currentState)
     {
-      _udpSocket.SendTo(_internalSendBuffer, SocketFlags.None, _peerEndPoint);
+      case ProtocolState.INITIAL:
+        {
+          if (_attemptCount >= MAX_ATTEMPTS)
+          {
+            throw new TimeoutException("Max retries reached");
+          }
+
+          if (!gotPeerBullets)
+          {
+            // have not yet seen any peer state
+            _attemptCount++;
+            break;
+          }
+
+          // we have seen peer's udp messages get in via UDP. It then publishes to state store that it sees peer at this session
+          PublishViewToPeer();
+          _currentState = ProtocolState.SEEN_PEER_STATE;
+
+          break;
+        }
+      case ProtocolState.SEEN_PEER_STATE:
+        {
+          // if the recvd bullets are from the same session who has posted state, that same session must be live right now, and if the live session can confirm that it sees us!
+          // we can establish that a bidirectionally viewable UDP channel has been established.
+          if (gotPeerBullets && TryReadPeerView(out short peerSessionId, out byte ourSessionIdViewedByPeer) && peerSessionId == _peerSessionId && ourSessionIdViewedByPeer == _mySessionId)
+          {
+            _currentState = ProtocolState.ESTABLISHED_CONNECTION;
+            return;
+          }
+
+          _attemptCount++;
+          _currentState = ProtocolState.INITIAL;
+          break;
+        }
+      case ProtocolState.ESTABLISHED_CONNECTION:
+        // nothing to do here, connection is established
+        break;
     }
-    NextImpl();
+
   }
 
-  // send a control packet with the given state and current sequence number
-  protected void SendBuffer(SynAckState state)
+  // send reliable state delivery to peer over common infra
+  private void PublishViewToPeer()
   {
-    _mySeq++;
-    _internalSendBuffer[0] = (byte)state;
-    _internalSendBuffer[1] = _mySeq;
-    _udpSocket.SendTo(_internalSendBuffer, SocketFlags.None, _peerEndPoint);
+    // what is my session id, what is the session Id I saw of peers
+    short view = (short)((_mySessionId << 8) | _peerSessionId); // my sessionId sits high, peer sessionId low
+    IDatabase db = _connectionMultiplexer.GetDatabase();
+    db.Execute("SET", _mySessionStateStoreKey, view);
   }
 
-  // utility that can drop old messages, and ignore bullets
-  protected bool ReadBuffer(SynAckState expectedState, out SynAckState recvdState, int timeoutMs)
+  private bool TryReadPeerView(out short peerSessionId, out byte ourSessionIdViewedByPeer)
   {
-    recvdState = SynAckState.None;
-    // micro to milli conversion
-    if (!_udpSocket.Poll(timeoutMs * 1_000, SelectMode.SelectRead))
+    peerSessionId = 0;
+    ourSessionIdViewedByPeer = 0;
+    IDatabase db = _connectionMultiplexer.GetDatabase();
+    RedisResult res = db.Execute("GET", _peerSessionStateStoreKey);
+    if (res.IsNull)
     {
       return false;
     }
+    short stateInt = (short)res;
+    peerSessionId = (short)((stateInt >> 8) & 0xFF);
+    ourSessionIdViewedByPeer = (byte)(stateInt & 0xFF);
+    return true;
+  }
 
-    int readBytes = _udpSocket.ReceiveFrom(_internalRecvBuffer, SocketFlags.None, ref _peerEndPoint);
-    Debug.Assert(readBytes % 2 == 0, "All ctrl packets being sent should be divisible by 2");
-    for (int i = 0; i < readBytes; i += 2)
+  private void ShootNatPenetrationBullets(int numBullets)
+  {
+    _mySeq++;
+    _internalSendBuffer[0] = (byte)1; // 1 represents bullet
+    _internalSendBuffer[1] = _mySessionId; // send the session id so peer can detect restarts
+    _internalSendBuffer[2] = _mySeq; // used to make sure when read a buffer we can find the latest udp message!
+    for (int i = 0; i < numBullets; i++)
     {
-      byte seq = _internalRecvBuffer[i + 1];
-      if (seq > _lastPeerSeq && recvdState != SynAckState.Bullet)
-      {
-        recvdState = (SynAckState)_internalRecvBuffer[i];
-      }
+      _udpSocket.SendTo(_internalSendBuffer, SocketFlags.None, _peerEndPoint);
+    }
+  }
 
-      Debug.Assert(recvdState != SynAckState.Initial, "Nobody sends Initial state packet on the buffer!");
-      if (recvdState == SynAckState.Bullet || seq <= _lastPeerSeq || recvdState != expectedState)
+  // reads and updates state for what it sees from peer
+  private bool TryReadNatPenetrationBullets()
+  {
+    if (!_udpSocket.Poll(250_000, SelectMode.SelectRead))
+    {
+      // timed out, did not receive any bullets
+      return false;
+    }
+
+    EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
+    int receivedBytes = _udpSocket.ReceiveFrom(_internalRecvBuffer, ref remoteEP);
+    if (receivedBytes % 3 != 0)
+    {
+      // invalid packet
+      return false;
+    }
+
+    if (receivedBytes < 3)
+    {
+      // invalid packet
+      return false;
+    }
+
+    bool gotSomeValidInfo = false;
+    for (int i = 0; i < receivedBytes; i += 3)
+    {
+      byte packetType = _internalRecvBuffer[i];
+      byte sessionId = _internalRecvBuffer[i + 1];
+      byte seqNum = _internalRecvBuffer[i + 2];
+
+      if (packetType != 1 || seqNum <= _peerSeq)
       {
         continue;
       }
-      _lastPeerSeq = seq;
-      _attemptCount = 0;
-      return true;
+
+      // new bullet packet. If this says that the session has changed we need to tell the state store that we see B at this session Id now!
+      _peerSessionId = sessionId;
+      _peerSeq = seqNum; // update that we see this new sequence number
+      gotSomeValidInfo = true;
     }
 
-    return false;
-  }
-}
-
-class SynAckStateMachineInitiator : SynAckStateMachineBase
-{
-  public SynAckStateMachineInitiator(Socket udpSocket, EndPoint peerEndPoint, ILogger? logger, ref byte startingSeq) : base(udpSocket, peerEndPoint, logger, ref startingSeq) { }
-
-  public override void NextImpl()
-  {
-    switch (_currentState)
-    {
-      case SynAckState.Initial:
-        // Send SYN to peer
-
-        if (_attemptCount >= MAX_ATTEMPTS)
-        {
-          _logger?.LogError("SynAck Initiator: Exceeded max attempts ({MaxAttempts}) in Initial state", MAX_ATTEMPTS);
-          throw new TimeoutException($"Failed to establish connection after {MAX_ATTEMPTS} attempts");
-        }
-
-        // Send SYN packets with sequence number
-        SendBuffer(SynAckState.Syn);
-        _logger?.LogDebug("SynAck Initiator: Sent SYN seq={Seq} (attempt {Attempt})", _mySeq, _attemptCount + 1);
-        _attemptCount++;
-        _currentState = SynAckState.Syn;
-        break;
-      case SynAckState.Syn:
-        // Wait for SYN-ACK packet ONLY Transition to SynAck state on receipt
-
-        // expected state from peer => SynAck
-        if (!ReadBuffer(SynAckState.SynAck, out SynAckState recvdState, 250) && recvdState == SynAckState.None)
-        {
-          // Timeout - resend SYN packet
-          _logger?.LogDebug("SynAck Initiator: Timeout waiting for SYN-ACK, retrying...");
-          _currentState = SynAckState.Initial; // resend SYN packets
-          break;
-        }
-
-        if (recvdState == SynAckState.SynAck)
-        {
-          _logger?.LogDebug("SynAck Initiator: Received SYN-ACK seq={Seq}", _lastPeerSeq);
-          _currentState = SynAckState.SynAck;
-        }
-
-        break;
-      case SynAckState.SynAck:
-        // Send ACK packet with sequence number to peer ALWAYS Transition to ACK state
-
-        SendBuffer(SynAckState.Ack);
-        _logger?.LogDebug("SynAck Initiator: Sent ACK seq={Seq}", _mySeq);
-        _currentState = SynAckState.Ack;
-        break;
-      case SynAckState.Ack:
-        // Connection established, wait briefly for any retransmitted packets and handle the possibility that peer terminates and the new attempt send us syn?
-        // The issue is that the sequence number would be below? so how would we ever know? I guess for the sam session then I can re-use the sequence number?
-
-        // we dont expect any transissions from the other end in a perfect world scenario
-        bool _ = ReadBuffer(SynAckState.None, out SynAckState recvdState1, 1_000); // always returns false here
-
-        if (recvdState1 == SynAckState.SynAck)
-        {
-          // New SYN-ACK retransmission - peer didn't get our ACK
-          _logger?.LogDebug("SynAck Initiator: Received retransmitted SYN-ACK seq={Seq}, New higher sequence means we need to reset the initiator", _lastPeerSeq); 
-          _currentState = SynAckState.SynAck;
-          return;
-        }
-
-        if (recvdState1 != SynAckState.None)
-        {
-          _currentState = SynAckState.Syn;
-          return;
-        }
-
-        _logger?.LogDebug("SynAck Initiator: Connection established");
-        _currentState = SynAckState.Established;
-        break;
-      case SynAckState.Established:
-        // Connection established
-        break;
-    }
-  }
-}
-
-class SynAckStateMachineResponder : SynAckStateMachineBase
-{
-  public SynAckStateMachineResponder(Socket udpSocket, EndPoint peerEndPoint, ILogger? logger, ref byte peerSeq) : base(udpSocket, peerEndPoint, logger, ref peerSeq) { }
-
-  public override void NextImpl()
-  {
-    switch (_currentState)
-    {
-      case SynAckState.Initial:
-        // Wait for SYN packet ONLY transition to Syn state on receipt
-      
-        if (_attemptCount >= MAX_ATTEMPTS)
-        {
-          _logger?.LogError("SynAck Responder: Exceeded max attempts ({MaxAttempts}) waiting for SYN", MAX_ATTEMPTS);
-          throw new TimeoutException($"Failed to receive SYN after {MAX_ATTEMPTS} attempts");
-        }
-
-        if (ReadBuffer(SynAckState.Syn, out SynAckState recvdState, 250))
-        {
-          _currentState = SynAckState.Syn;
-        }
-        else
-        {
-          _attemptCount++;
-        }
-
-        break;
-      case SynAckState.Syn:
-        // Send SYN-ACK and ALWAYS Transition to SynAck state
-      
-        SendBuffer(SynAckState.SynAck);
-        _logger?.LogDebug("SynAck Responder: Sent SYN-ACK seq={Seq}", _mySeq);
-        _currentState = SynAckState.SynAck;
-        break;
-      case SynAckState.SynAck:
-        // Wait for ACK packet ONLY Transition to Ack state on receipt
-
-        if (_attemptCount >= MAX_ATTEMPTS)
-        {
-          _logger?.LogError("SynAck Responder: Exceeded max attempts ({MaxAttempts}) waiting for ACK", MAX_ATTEMPTS);
-          throw new TimeoutException($"Failed to receive ACK after {MAX_ATTEMPTS} attempts");
-        }
-
-        // Wait for ACK packet
-        if (ReadBuffer(SynAckState.Ack, out SynAckState recvdState1, 250))
-        {
-          _currentState = SynAckState.Ack;
-          return;
-        }
-
-        if (recvdState1 == SynAckState.Syn)
-        {
-          _currentState = SynAckState.Syn;
-          return;
-        }
-
-        _attemptCount++;
-        break;
-      case SynAckState.Ack:
-        // Connection established
-        // ONLY Transition to Established state on no further packets received within timeout        
-
-        bool _ = ReadBuffer(SynAckState.None, out SynAckState recvdState2, 5_000); // always returns false here
-
-        if (recvdState2 != SynAckState.None)
-        {
-          _currentState = SynAckState.Syn;
-          return;
-        }
-
-        _logger?.LogDebug("SynAck Initiator: Connection established");
-        _currentState = SynAckState.Established;
-        break;
-      case SynAckState.Established:
-        // Already established, no further state
-        break;
-    }
+    return gotSomeValidInfo;
   }
 }
 
 #endregion
 
+#region HolePunching State Machine
+
 enum HolePunchingState
 {
   // move to RegisteredWithServer by contacting STUN server and registering with registration server
-  Initial = 0,
+  INITIAL = 0,
   // check if peer has also registered, if not retry till max retries reached, then move to ReceivedPeerInfo. If max retries reached move to Closed
-  RegisteredWithServer,
+  REGISTRATION_WITH_SERVER,
   // try to do hole punching by sending packets to peer's external IP:port, move to EstablishedConnection on success else refetch peer info and retry (move back to RegisteredWithServer)
   // if max retries reached move to Closed
-  ReceivedPeerInfo,
+  RECEIVED_PEER_INFO,
   // connection established, can now use the UDP socket for communication, if Next() is called again, move to Closed
-  EstablishedConnection,
+  ESTABLISHED_CONNECTION,
   // perform cleanup of resources and deregister from server, then move back to Initial for potential future connections
-  Closed,
+  CLOSED,
 }
 
 internal class HolePunchingStateMachine : IAsyncDisposable
@@ -341,14 +273,14 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   private string? _peerId;
   private int _peerPort;
   // used to handle synchronization when 2 peers are in 2 different states in the SynAck state machine
-  private byte _peerSeq;
+  private byte _sessionId;
   internal IPEndPoint? _peerEndPoint;
   private Socket? _udpSocket;
 
   // IDisposable support
   private bool _isDisposed;
 
-  private HolePunchingState CurrentState { get; set; } = HolePunchingState.Initial;
+  private HolePunchingState CurrentState { get; set; } = HolePunchingState.INITIAL;
 
   // This is the primary inteface to get the hole punched socket once connection is established
   // The user should not dispose this socket, it will be disposed when the state machine is disposed
@@ -356,7 +288,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   {
     get
     {
-      if (CurrentState != HolePunchingState.EstablishedConnection)
+      if (CurrentState != HolePunchingState.ESTABLISHED_CONNECTION)
       {
         throw new InvalidOperationException("Connection not yet established.");
       }
@@ -384,7 +316,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
 
   public async Task<bool> ConnectAsync(string peerId)
   {
-    if (CurrentState != HolePunchingState.Initial)
+    if (CurrentState != HolePunchingState.INITIAL)
     {
       throw new InvalidOperationException($"Connection process already started. {CurrentState}");
     }
@@ -400,15 +332,15 @@ internal class HolePunchingStateMachine : IAsyncDisposable
       _logger?.LogDebug("HolePunching State Transition: {CurrentState} => state {NextState}, retry count {RegistrationRetryCount}, send punch retry count {SendPunchRetryCount}",
         currentState, nextState, _registrationRetryCount, _sendPunchRetryCount);
     }
-    while (nextState != HolePunchingState.EstablishedConnection && nextState != HolePunchingState.Initial);
+    while (nextState != HolePunchingState.ESTABLISHED_CONNECTION && nextState != HolePunchingState.INITIAL);
 
-    return CurrentState == HolePunchingState.EstablishedConnection;
+    return CurrentState == HolePunchingState.ESTABLISHED_CONNECTION;
   }
 
   public async Task CloseAsync()
   {
     // Connection should have already been in EstablishedConnection state for close to be viable
-    if (CurrentState != HolePunchingState.EstablishedConnection)
+    if (CurrentState != HolePunchingState.ESTABLISHED_CONNECTION)
     {
       throw new InvalidOperationException("Connection not yet established.");
     }
@@ -424,7 +356,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   {
     switch (CurrentState)
     {
-      case HolePunchingState.Initial: // At this stage we don't have an active UDP socket yet and have not registered our ephemeral port with server since we don't know it yet
+      case HolePunchingState.INITIAL: // At this stage we don't have an active UDP socket yet and have not registered our ephemeral port with server since we don't know it yet
         Debug.Assert(_peerId != null, "Invariant Violation: Set by ConnectAsync before calling Next()");
         Debug.Assert(_udpSocket == null, "Invariant Violation: No UDP socket should exist in initial state");
         Debug.Assert(_peerIp == null, "Invariant Violation: if we have not yet received peer info from server this should still be null");
@@ -436,14 +368,14 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         _logger?.LogDebug("HolePunching: Initializing UDP socket and registering with server");
 
         // Initialize UDP socket and register self and port with server
-        _peerSeq = 0;
+        _sessionId = 0;
         _udpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
 
         // Make sure we are not behing a NAT that is symmetric otherwise hole punching will likely fail
         if (await MinimalStunClient.IsSymmetricNatAsync(_udpSocket, STUN_SERVERS))
         {
           _logger?.LogError("HolePunching: Symmetric NAT detected, hole punching will fail");
-          CurrentState = HolePunchingState.Closed;
+          CurrentState = HolePunchingState.CLOSED;
           break;
         }
 
@@ -453,9 +385,9 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         _logger?.LogDebug("HolePunching: Discovered public IP {PublicIP} and port {PublicPort} via STUN", publicIp, ephemeralPort);
         await RegisterWithServerAsync(publicIp, ephemeralPort); // Let any failure in registration propagate up, redis stack exchange client should have already retried internally if needed
 
-        CurrentState = HolePunchingState.RegisteredWithServer;
+        CurrentState = HolePunchingState.REGISTRATION_WITH_SERVER;
         break;
-      case HolePunchingState.RegisteredWithServer:
+      case HolePunchingState.REGISTRATION_WITH_SERVER:
         Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial");
         Debug.Assert(_peerId != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
         Debug.Assert(_peerIp == null, "Invariant Violation: if we have not yet received peer info from server this should still be null");
@@ -465,7 +397,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         if (_registrationRetryCount >= _maxRetryCount)
         {
           // Exceeded max retries, mark as failed
-          CurrentState = HolePunchingState.Closed;
+          CurrentState = HolePunchingState.CLOSED;
           break;
         }
 
@@ -493,10 +425,10 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         _peerPort = int.Parse(peerParts[1]);
         _peerEndPoint = new IPEndPoint(_peerIp, _peerPort);
         _logger?.LogDebug("HolePunching: Received peer info: {PeerInfo}", peerInfo);
-        CurrentState = HolePunchingState.ReceivedPeerInfo;
+        CurrentState = HolePunchingState.RECEIVED_PEER_INFO;
         break;
 
-      case HolePunchingState.ReceivedPeerInfo:
+      case HolePunchingState.RECEIVED_PEER_INFO:
         Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial");
         Debug.Assert(_peerIp != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
         Debug.Assert(_peerId != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
@@ -506,7 +438,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         if (_sendPunchRetryCount >= _maxRetryCount)
         {
           // Exceeded max retries, mark as failed
-          CurrentState = HolePunchingState.Closed;
+          CurrentState = HolePunchingState.CLOSED;
           _logger?.LogDebug("HolePunching: Exceeded max retries, marking as failed");
           break;
         }
@@ -517,27 +449,16 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         try
         {
           // Based on role assignemnt create appropriate state machine
-          SynAckStateMachineBase stateMachine = _isSelfA ? 
-            new SynAckStateMachineInitiator(_udpSocket, _peerEndPoint, _logger, ref _peerSeq) : new SynAckStateMachineResponder(_udpSocket, _peerEndPoint, _logger, ref _peerSeq);
+          HandshakeStateMachine stateMachine = new HandshakeStateMachine(_selfId, _peerId, _sessionId, _udpSocket, _peerEndPoint, _logger, _connectionMultiplexer);
 
-          SynAckState prevState = stateMachine.CurrentState;
-          for (; stateMachine.CurrentState != SynAckState.Established;)
+          while (stateMachine.CurrentState != ProtocolState.ESTABLISHED_CONNECTION)
           {
             stateMachine.Next();
-            // no state change. this could be due to timeouts waiting for packets etc
-            if (stateMachine.CurrentState == prevState)
-            {
-              continue;
-            }
-
-            _logger?.LogDebug("HolePunching: {Role} State Machine Transition: {PrevState} => {CurrentState}", _isSelfA ? "Initiator" : "Responder", prevState, stateMachine.CurrentState);
-            prevState = stateMachine.CurrentState;
           }
           connected = true;
         }
-        catch (Exception ex)
+        catch (TimeoutException)
         {
-          _logger?.LogError(ex, "HolePunching: Exception during hole punching synchronization with peer at {PeerEndPoint}", _peerEndPoint);
         }
 
         if (!connected)
@@ -548,32 +469,32 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           _peerEndPoint = null!; // reset peer endpoint to force re-creation
           _peerIp = null;
           _peerPort = 0;
-          CurrentState = HolePunchingState.RegisteredWithServer;
+          CurrentState = HolePunchingState.REGISTRATION_WITH_SERVER;
           _logger?.LogDebug("HolePunching: Did not receive response from peer, retrying...");
           break;
         }
 
         // Successfully received response from peer
         _sendPunchRetryCount = 0;
-        CurrentState = HolePunchingState.EstablishedConnection;
+        CurrentState = HolePunchingState.ESTABLISHED_CONNECTION;
         break;
 
-      case HolePunchingState.EstablishedConnection:
+      case HolePunchingState.ESTABLISHED_CONNECTION:
         Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial");
         Debug.Assert(_peerId != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
         Debug.Assert(_peerIp != null, "Invariant Violation: Set by ConnectAsync before calling Next() this should still hold");
         Debug.Assert(_peerPort >= 0, "Invariant Violation: Should have been received from server in previous state RegisteredWithServer");
         Debug.Assert(_peerEndPoint != null, "Invariant Violation: Should have been created in previous state RegisteredWithServer");
 
-        CurrentState = HolePunchingState.Closed;
+        CurrentState = HolePunchingState.CLOSED;
         break;
 
-      case HolePunchingState.Closed:
+      case HolePunchingState.CLOSED:
         Debug.Assert(_udpSocket != null, "Invariant Violation: UDP socket should have been created in previous state Initial");
 
         // If next was called on this state, then the want is to close the connection.
         // if state was past RegisteredWithServer we need to deregister from server as a best effort way otherwise TTL will expire our registration in worst case!
-        if (CurrentState != HolePunchingState.Initial)
+        if (CurrentState != HolePunchingState.INITIAL)
         {
           await DeregisterFromServerAsync();
         }
@@ -593,7 +514,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         _peerEndPoint = null!;
         _isSelfA = false;
 
-        CurrentState = HolePunchingState.Initial;
+        CurrentState = HolePunchingState.INITIAL;
         break;
     }
 
@@ -617,7 +538,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
     if (!_isDisposed)
     {
       // Close the connection if it's established (deregister from server, cleanup socket)
-      if (CurrentState == HolePunchingState.EstablishedConnection)
+      if (CurrentState == HolePunchingState.ESTABLISHED_CONNECTION)
       {
         try
         {
