@@ -53,7 +53,7 @@ class HandshakeStateMachine
 
   // borrowed socket from HolePunchingStateMachine. DO NOT DISPOSE
   private readonly Socket _udpSocket;
-  private readonly byte _mySessionId;
+  private readonly int _mySessionId;
 
   // borrowed conn mux, DO NOT DISPOSE
   private readonly IConnectionMultiplexer _connectionMultiplexer;
@@ -61,8 +61,8 @@ class HandshakeStateMachine
   private readonly string _peerSessionStateStoreKey;
   private readonly EndPoint _peerEndPoint;
   private readonly ILogger? _logger;
-  private readonly byte[] _internalRecvBuffer = new byte[33]; // divisible by 3 right now, should add byte packing in future
-  private readonly byte[] _internalSendBuffer = new byte[3];
+  private readonly byte[] _internalRecvBuffer = new byte[36]; // 1 byte type + 4 bytes sessionId + 1 byte seq = 6 bytes per packet, buffer holds 6 packets
+  private readonly byte[] _internalSendBuffer = new byte[6]; // 1 byte type + 4 bytes sessionId + 1 byte seq
   private readonly bool _isA;
 
   // Non-readonly fields
@@ -70,13 +70,13 @@ class HandshakeStateMachine
   private int _attemptCount = 0;
 
   // Sequence numbers for detecting duplicates and old packets (de-dupe and ordering)
-  private byte _peerSessionId = 0; // peer session id is mutable since if peer session id changes we need to rollback our state machine to match with theirs
+  private int _peerSessionId = 0; // peer session id is mutable since if peer session id changes we need to rollback our state machine to match with theirs
   private byte _mySeq;
   private byte _peerSeq;
 
   public ProtocolState CurrentState => _currentState;
 
-  public HandshakeStateMachine(string selfId, string peerId, byte sessionId, Socket udpSocket, EndPoint peerEndPoint, ILogger? logger, IConnectionMultiplexer connectionMultiplexer)
+  public HandshakeStateMachine(string selfId, string peerId, int sessionId, Socket udpSocket, EndPoint peerEndPoint, ILogger? logger, IConnectionMultiplexer connectionMultiplexer)
   {
     _udpSocket = udpSocket;
     _peerEndPoint = peerEndPoint;
@@ -128,7 +128,7 @@ class HandshakeStateMachine
         {
           // if the recvd bullets are from the same session who has posted state, that same session must be live right now, and if the live session can confirm that it sees us!
           // we can establish that a bidirectionally viewable UDP channel has been established.
-          if (gotPeerBullets && TryReadPeerView(out byte peerSessionId, out byte ourSessionIdViewedByPeer))
+          if (gotPeerBullets && TryReadPeerView(out int peerSessionId, out int ourSessionIdViewedByPeer))
           {
             _logger?.LogDebug("HandshakeStateMachine: Read peer view from state store PeerSessionId: {PeerSessionId}, {PeersViewOfOurSessionId}",
               peerSessionId, ourSessionIdViewedByPeer);
@@ -164,22 +164,22 @@ class HandshakeStateMachine
   private void PublishViewToPeer()
   {
     // what is my session id, what is the session Id I saw of peers
-    // A writes their session ID high, B writes their session ID low
-    short view;
+    // A writes their session ID high (upper 32 bits), B writes their session ID low (lower 32 bits)
+    long view;
     if (_isA)
     {
-      view = (short)((_mySessionId << 8) | _peerSessionId);
+      view = ((long)_mySessionId << 32) | (uint)_peerSessionId;
     }
     else
     {
-      view = (short)((_peerSessionId << 8) | _mySessionId);
+      view = ((long)_peerSessionId << 32) | (uint)_mySessionId;
     }
 
     IDatabase db = _connectionMultiplexer.GetDatabase();
-    db.Execute("SET", _mySessionStateStoreKey, (int)view);
+    db.Execute("SET", _mySessionStateStoreKey, view);
   }
 
-  private bool TryReadPeerView(out byte peerSessionId, out byte ourSessionIdViewedByPeer)
+  private bool TryReadPeerView(out int peerSessionId, out int ourSessionIdViewedByPeer)
   {
     peerSessionId = 0;
     ourSessionIdViewedByPeer = 0;
@@ -189,17 +189,17 @@ class HandshakeStateMachine
     {
       return false;
     }
-    short stateInt = (short)res;
+    long stateLong = (long)res;
     if (_isA)
     {
-      ourSessionIdViewedByPeer = (byte)((stateInt >> 8) & 0xFF);
-      peerSessionId = (byte)(stateInt & 0xFF);
+      ourSessionIdViewedByPeer = (int)((stateLong >> 32) & 0xFFFFFFFF);
+      peerSessionId = (int)(stateLong & 0xFFFFFFFF);
     }
     // low bits belong to peerB
     else
     {
-      peerSessionId = (byte)((stateInt >> 8) & 0xFF);
-      ourSessionIdViewedByPeer = (byte)(stateInt & 0xFF);
+      peerSessionId = (int)((stateLong >> 32) & 0xFFFFFFFF);
+      ourSessionIdViewedByPeer = (int)(stateLong & 0xFFFFFFFF);
     }
 
     return true;
@@ -209,8 +209,12 @@ class HandshakeStateMachine
   {
     _mySeq++;
     _internalSendBuffer[0] = (byte)1; // 1 represents bullet
-    _internalSendBuffer[1] = _mySessionId; // send the session id so peer can detect restarts
-    _internalSendBuffer[2] = _mySeq; // used to make sure when read a buffer we can find the latest udp message!
+    // Pack int sessionId into 4 bytes (big-endian)
+    _internalSendBuffer[1] = (byte)(_mySessionId >> 24);
+    _internalSendBuffer[2] = (byte)(_mySessionId >> 16);
+    _internalSendBuffer[3] = (byte)(_mySessionId >> 8);
+    _internalSendBuffer[4] = (byte)_mySessionId;
+    _internalSendBuffer[5] = _mySeq; // used to make sure when read a buffer we can find the latest udp message!
     for (int i = 0; i < numBullets; i++)
     {
       _udpSocket.SendTo(_internalSendBuffer, SocketFlags.None, _peerEndPoint);
@@ -229,26 +233,30 @@ class HandshakeStateMachine
 
     EndPoint remoteEP = new IPEndPoint(IPAddress.Any, 0);
     int receivedBytes = _udpSocket.ReceiveFrom(_internalRecvBuffer, ref remoteEP);
-    if (receivedBytes % 3 != 0)
+    if (receivedBytes % 6 != 0)
     {
       // invalid packet
-      _logger?.LogError("HandshakeStateMachine: Invalid UDP bullet packet received with size not multiple of 3");
+      _logger?.LogError("HandshakeStateMachine: Invalid UDP bullet packet received with size not multiple of 6");
       return false;
     }
 
-    if (receivedBytes < 3)
+    if (receivedBytes < 6)
     {
       // invalid packet
-      _logger?.LogError("HandshakeStateMachine: Invalid UDP bullet packet received with size less than 3 bytes");
+      _logger?.LogError("HandshakeStateMachine: Invalid UDP bullet packet received with size less than 6 bytes");
       return false;
     }
 
     bool gotSomeValidInfo = false;
-    for (int i = 0; i < receivedBytes; i += 3)
+    for (int i = 0; i < receivedBytes; i += 6)
     {
       byte packetType = _internalRecvBuffer[i];
-      byte sessionId = _internalRecvBuffer[i + 1];
-      byte seqNum = _internalRecvBuffer[i + 2];
+      // Unpack int sessionId from 4 bytes (big-endian)
+      int sessionId = (_internalRecvBuffer[i + 1] << 24) |
+                      (_internalRecvBuffer[i + 2] << 16) |
+                      (_internalRecvBuffer[i + 3] << 8) |
+                      _internalRecvBuffer[i + 4];
+      byte seqNum = _internalRecvBuffer[i + 5];
 
       _logger?.LogDebug("HandshakeStateMachine: Received UDP bullet packet - Type: {PacketType}, SessionId: {SessionId}, SeqNum: {SeqNum}",
         packetType, sessionId, seqNum);
@@ -317,7 +325,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   private string? _peerId;
   private int _peerPort;
   // used to handle synchronization when 2 peers are in 2 different states in the SynAck state machine
-  private byte _sessionId;
+  private int _sessionId;
   internal IPEndPoint? _peerEndPoint;
   private Socket? _udpSocket;
 
@@ -412,7 +420,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         _logger?.LogDebug("HolePunching: Initializing UDP socket and registering with server");
 
         // Initialize UDP socket and register self and port with server
-        _sessionId = 0;
+        _sessionId = Random.Shared.Next();
         _udpSocket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
 
         // Make sure we are not behing a NAT that is symmetric otherwise hole punching will likely fail
