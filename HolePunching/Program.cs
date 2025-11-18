@@ -297,7 +297,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
     }
   }
 
-  public HolePunchingStateMachine(string selfId, string registrationServerAddr, int maxRetryCount = 5, ILogger? logger = null)
+  public HolePunchingStateMachine(string selfId, string registrationServerAddr, int maxRetryCount = 60, ILogger? logger = null)
   {
     ArgumentOutOfRangeException.ThrowIfNegative(maxRetryCount);
 
