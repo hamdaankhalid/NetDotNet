@@ -80,8 +80,8 @@ abstract class SynAckStateMachineBase
   // As long as the state machine is kept active we actually want to keep sending bullets
   public void Next()
   {
-    _internalSendBuffer[0] = (byte)SynAckState.Bullet;
-    _internalSendBuffer[1] = 0; // the sequence number doesn't matter in Bullet packets
+      _internalSendBuffer[0] = (byte)SynAckState.Bullet;
+      _internalSendBuffer[1] = 0; // the sequence number doesn't matter in Bullet packets
     for (int i = 0; i < 10; i++) // 10 bullets per state?
     {
       _udpSocket.SendTo(_internalSendBuffer, SocketFlags.None, _peerEndPoint);
@@ -98,10 +98,11 @@ abstract class SynAckStateMachineBase
     _udpSocket.SendTo(_internalSendBuffer, SocketFlags.None, _peerEndPoint);
   }
 
-  // utility that can drop old messages 
+  // utility that can drop old messages, and ignore bullets
   protected bool ReadBuffer(SynAckState expectedState, out SynAckState recvdState, int timeoutMs)
   {
     recvdState = SynAckState.None;
+    // micro to milli conversion
     if (!_udpSocket.Poll(timeoutMs * 1_000, SelectMode.SelectRead))
     {
       return false;
@@ -523,7 +524,9 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         try
         {
           // Based on role assignemnt create appropriate state machine
-          SynAckStateMachineBase stateMachine = _isSelfA ? new SynAckStateMachineInitiator(_udpSocket, _peerEndPoint, _logger, ref _peerSeq) : new SynAckStateMachineResponder(_udpSocket, _peerEndPoint, _logger, ref _peerSeq);
+          SynAckStateMachineBase stateMachine = _isSelfA ? 
+            new SynAckStateMachineInitiator(_udpSocket, _peerEndPoint, _logger, ref _peerSeq) : new SynAckStateMachineResponder(_udpSocket, _peerEndPoint, _logger, ref _peerSeq);
+
           SynAckState prevState = stateMachine.CurrentState;
           for (; stateMachine.CurrentState != SynAckState.Established;)
           {
