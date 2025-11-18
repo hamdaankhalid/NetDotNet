@@ -60,7 +60,7 @@ abstract class SynAckStateMachineBase
   public SynAckState CurrentState => _currentState;
 
   protected int _attemptCount = 0;
-  protected const int MAX_ATTEMPTS = 20; // ~5 seconds with 250ms polls
+  protected const int MAX_ATTEMPTS = 40; // ~5 seconds with 250ms polls
 
   // Sequence numbers for detecting duplicates and old packets
   protected byte _mySeq = 0;      // Sequence number I send
@@ -82,7 +82,7 @@ abstract class SynAckStateMachineBase
   {
     _internalSendBuffer[0] = (byte)SynAckState.Bullet;
     _internalSendBuffer[1] = 0; // the sequence number doesn't matter in Bullet packets
-    for (int i = 0; i < 5; i++)
+    //for (int i = 0; i < ; i++)
     {
       _udpSocket.SendTo(_internalSendBuffer, SocketFlags.None, _peerEndPoint);
     }
