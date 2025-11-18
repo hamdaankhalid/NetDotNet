@@ -138,6 +138,7 @@ class HandshakeStateMachine
         break;
     }
 
+    Thread.Sleep(250); // small delay to avoid busy looping
   }
 
   // send reliable state delivery to peer over common infra
