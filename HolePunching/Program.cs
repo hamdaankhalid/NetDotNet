@@ -97,6 +97,8 @@ class HandshakeStateMachine
     // read penetration bullets
     bool gotPeerBullets = TryReadNatPenetrationBullets();
     // we have seen peer's udp messages get in via UDP. It then publishes to state store that it sees peer at this session
+    _logger?.LogDebug("HandshakeStateMachine: Publishing view to peer {mySessionId} {peerSessionId}", _mySessionId, _peerSessionId);
+
     PublishViewToPeer();
 
     switch (_currentState)
@@ -126,6 +128,9 @@ class HandshakeStateMachine
           // we can establish that a bidirectionally viewable UDP channel has been established.
           if (gotPeerBullets && TryReadPeerView(out short peerSessionId, out byte ourSessionIdViewedByPeer))
           {
+            _logger?.LogDebug("HandshakeStateMachine: Read peer view from state store PeerSessionId: {PeerSessionId}, {PeersViewOfOurSessionId}",
+              peerSessionId, ourSessionIdViewedByPeer);
+
             if (peerSessionId == _peerSessionId && ourSessionIdViewedByPeer == _mySessionId)
             {
               _currentState = ProtocolState.ESTABLISHED_CONNECTION;
