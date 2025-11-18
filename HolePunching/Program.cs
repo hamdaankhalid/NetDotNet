@@ -48,7 +48,7 @@ enum ProtocolState : byte
 
 class HandshakeStateMachine
 {
-  private const int MAX_ATTEMPTS = 200; // ~5 seconds with 250ms polls
+  private const int MAX_ATTEMPTS = 50; // ~5 seconds with 250ms polls
   private static string STATE_STORE_KEY_PREFIX = "HolePunching:SynAckStateMachine:";
 
   // borrowed socket from HolePunchingStateMachine. DO NOT DISPOSE
