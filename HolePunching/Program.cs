@@ -512,7 +512,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
               continue;
             }
 
-            _logger?.LogDebug("HolePunching: State Machine Transition: {PrevState} => {CurrentState}", prevState, stateMachine.CurrentState);
+            _logger?.LogDebug("HolePunching: {Role} State Machine Transition: {PrevState} => {CurrentState}", _isSelfA ? "Initiator" : "Responder", prevState, stateMachine.CurrentState);
             prevState = stateMachine.CurrentState;
           }
           connected = true;
