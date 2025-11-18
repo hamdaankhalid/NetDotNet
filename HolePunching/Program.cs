@@ -463,6 +463,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
 
         if (!connected)
         {
+          _sessionId++; // increment session id for next attempt
           _sendPunchRetryCount++;
           // Peer may not have registered yet
           // retry sending punch packet by moving one level back on state where we will reget Peer's info and resend punch packet incase the first was not received
