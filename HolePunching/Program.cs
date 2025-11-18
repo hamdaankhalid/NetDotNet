@@ -232,7 +232,7 @@ class SynAckStateMachineResponder : SynAckStateMachineBase
         {
           _currentState = SynAckState.Syn;
         }
-        else if (recvdState != SynAckState.None)
+        else
         {
           _attemptCount++;
         }
