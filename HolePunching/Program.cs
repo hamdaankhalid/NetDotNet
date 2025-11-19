@@ -61,12 +61,11 @@ class HandshakeStateMachine
   private readonly byte[] _internalRecvBuffer = new byte[6 * 10]; // 1 byte type + 4 bytes sessionId + 1 byte seq = 6 bytes per packet, buffer should hold a multiple of 6
   private readonly byte[] _internalSendBuffer = new byte[6]; // 1 byte type + 4 bytes sessionId + 1 byte seq
   private readonly bool _isA;
-  private readonly long _timeoutTimeStamp;
+  private readonly long _timeoutTicks;
 
   // Non-readonly fields
-  private long _startTimeStamp;
+  private long _startTimeStampTicks;
   private ProtocolState _currentState = ProtocolState.INITIAL;
-  private int _attemptCount = 0;
 
   // Sequence numbers for detecting duplicates and old packets (de-dupe and ordering)
   private int _peerSessionId = 0; // peer session id is mutable since if peer session id changes we need to rollback our state machine to match with theirs
@@ -88,15 +87,14 @@ class HandshakeStateMachine
     _mySessionStateStoreKey = $"{STATE_STORE_KEY_PREFIX}/{selfId}/{peerId}"; // I can ONLY write to this
     _peerSessionStateStoreKey = $"{STATE_STORE_KEY_PREFIX}/{peerId}/{selfId}"; // I can ONLY read from this. This read write separation means no concurrent write data races can occur
 
-    _timeoutTimeStamp = DateTimeOffset.UtcNow.Add(timeoutDuration).Ticks;
+    _timeoutTicks = timeoutDuration.Ticks;
+    _startTimeStampTicks = DateTimeOffset.UtcNow.Ticks;
   }
 
   // As long as the state machine is kept active we actually want to keep sending bullets
   public void Next()
   {
-    _startTimeStamp = _startTimeStamp == 0 ? DateTimeOffset.UtcNow.Ticks : _startTimeStamp;
-
-    if (_startTimeStamp + _timeoutTimeStamp >= DateTimeOffset.UtcNow.Ticks)
+    if (_startTimeStampTicks + _timeoutTicks <= DateTimeOffset.UtcNow.Ticks)
     {
       throw new TimeoutException("Max handshake attempts reached without establishing connection.");
     }
@@ -136,7 +134,6 @@ class HandshakeStateMachine
       _logger?.LogDebug("HandshakeStateMachine: {reason}", gotNewPeerBullets ? "Failed to read peer view from state store" : "No valid UDP bullets received from peer");
     }
 
-    _attemptCount++;
     _currentState = ProtocolState.INITIAL;
   }
 
@@ -304,7 +301,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   private readonly string _selfId;
   private readonly int _maxRetryCount;
   private readonly ILogger? _logger;
-  private readonly long _timeoutTimeStamp;
+  private readonly long _timeoutDurationTicks;
 
   // State - Mutable fields 
   private int _registrationRetryCount;
@@ -316,7 +313,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   private Socket? _udpSocket;
   // used to handle synchronization when 2 peers are in 2 different states in the SynAck state machine
   private int _sessionId;
-  private long _startTimeStamp;
+  private long _startTimeStampTicks;
 
   // IDisposable support
   private bool _isDisposed;
@@ -354,17 +351,17 @@ internal class HolePunchingStateMachine : IAsyncDisposable
     _maxRetryCount = maxRetryCount;
     _logger = logger;
 
-    _timeoutTimeStamp = timeout.HasValue ? timeout.Value.Ticks : TimeSpan.FromSeconds(30).Ticks; // default to 30 seconds
+    _timeoutDurationTicks = timeout.HasValue ? timeout.Value.Ticks : TimeSpan.FromSeconds(30).Ticks; // default to 30 seconds
   }
 
   private bool TimeoutExceeded()
   {
-    return _startTimeStamp + _timeoutTimeStamp <= DateTimeOffset.UtcNow.Ticks;
+    return _startTimeStampTicks + _timeoutDurationTicks > DateTimeOffset.UtcNow.Ticks;
   }
 
   public async Task<bool> ConnectAsync(string peerId)
   {
-    _startTimeStamp = _startTimeStamp == 0 ? DateTimeOffset.UtcNow.Ticks : _startTimeStamp;
+    _startTimeStampTicks = _startTimeStampTicks == 0 ? DateTimeOffset.UtcNow.Ticks : _startTimeStampTicks;
   
     if (CurrentState != HolePunchingState.INITIAL)
     {
