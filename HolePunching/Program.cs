@@ -69,7 +69,7 @@ class HandshakeStateMachine
 
   // Sequence numbers for detecting duplicates and old packets (de-dupe and ordering)
   private int _peerSessionId = 0; // peer session id is mutable since if peer session id changes we need to rollback our state machine to match with theirs
-  private byte _mySeq;
+  private byte _mySeq = 1; // start sending seq from 1 since we start a peer's view at 0 for providing "no info" semantics
   private byte _peerSeq;
 
   public ProtocolState CurrentState => _currentState;
@@ -234,8 +234,15 @@ class HandshakeStateMachine
                       _internalRecvBuffer[i + 4];
       byte seqNum = _internalRecvBuffer[i + 5];
 
-      if (packetType != 1 || seqNum <= _peerSeq)
+      if (packetType != 1)
       {
+        _logger?.LogError("HandshakeStateMachine: Invalid UDP bullet packet received with unknown packet type {PacketType}", packetType);
+        continue;
+      }
+
+      if (seqNum <= _peerSeq)
+      {
+        _logger?.LogDebug("HandshakeStateMachine: Ignoring UDP bullet packet with old or duplicate SeqNum {SeqNum}", seqNum);
         continue;
       }
 
