@@ -94,7 +94,7 @@ class HandshakeStateMachine
   // As long as the state machine is kept active we actually want to keep sending bullets
   public void Next()
   {
-    if (_startTimeStampTicks + _timeoutTicks <= DateTimeOffset.UtcNow.Ticks)
+    if (DateTimeOffset.UtcNow.Ticks >= _startTimeStampTicks + _timeoutTicks)
     {
       throw new TimeoutException("Max handshake attempts reached without establishing connection.");
     }
