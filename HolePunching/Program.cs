@@ -352,6 +352,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
     _logger = logger;
 
     _timeoutDurationTicks = timeout.HasValue ? timeout.Value.Ticks : TimeSpan.FromSeconds(30).Ticks; // default to 30 seconds
+    _startTimeStampTicks = DateTimeOffset.UtcNow.Ticks;
   }
 
   private bool TimeoutExceeded()
@@ -361,7 +362,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
 
   public async Task<bool> ConnectAsync(string peerId)
   {
-    _startTimeStampTicks = _startTimeStampTicks == 0 ? DateTimeOffset.UtcNow.Ticks : _startTimeStampTicks;
   
     if (CurrentState != HolePunchingState.INITIAL)
     {
