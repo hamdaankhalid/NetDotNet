@@ -29,7 +29,7 @@ and thus without any listening sockets you have peer to peer communication.
 */
 
 
-# region AckSyn State Machine
+# region Handshake State Machine
 // State machine to manage the handshake for hole punching over UDP.
 // It uses Garnet/Redis as the reliable delivery mechanism to exchange control messages between peers to coordinate the hole punching process
 // once it is clear that both peers have an open state, we know that connection has been established!
@@ -42,7 +42,6 @@ enum ProtocolState : byte
 {
   INITIAL, // we have not yet seen any peer state
   SEEN_PEER_STATE, // this is reached when it sees peer's udp messages get in via UDP. It then publishes to state store that it sees peer at this session
-  WAITING_TO_ESTABLISH, // polls state store for peer seeing our state, and confirms we also saw their state in the most recent session id published by them
   ESTABLISHED_CONNECTION
 }
 
@@ -101,7 +100,10 @@ class HandshakeStateMachine
     // we have seen peer's udp messages get in via UDP. It then publishes to state store that it sees peer at this session
     _logger?.LogDebug("HandshakeStateMachine: Publishing {isA} view to peer {mySessionId} {peerSessionId}", _isA ? "A" : "B", _mySessionId, _peerSessionId);
 
-    PublishViewToPeer();
+    if (gotPeerBullets)
+    {
+      PublishViewToPeer();
+    }
     
     bool readPeerView = TryReadPeerView(out int peerSessionId, out int ourSessionIdViewedByPeer);
 
@@ -230,6 +232,7 @@ class HandshakeStateMachine
     {
       // timed out, did not receive any bullets
       _logger?.LogDebug("HandshakeStateMachine: No UDP bullets received from peer within timeout");
+      _peerSessionId = 0; // semantically this means we don't see any valid peer bullets
       return false;
     }
 
@@ -558,7 +561,6 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           _udpSocket.Dispose();
           _udpSocket = null;
         }
-
 
         _registrationRetryCount = 0;
         _handshakeRetryCount = 0;
