@@ -95,12 +95,9 @@ class HandshakeStateMachine
     // state machines should use the backing store for reliable delivery of state messages not UDP
     // UDP is only kept for hole punching keep-alive bullets, only once the established state is reached should UDP be used for actual data transfer
     ShootNatPenetrationBullets(1); // 3 bullets per state call to keep NAT mappings alive
-    // read penetration bullets
+    // read penetration bullets that could have been sent by peer
     bool gotPeerBullets = TryReadNatPenetrationBullets();
-    if (gotPeerBullets)
-    {
-      PublishViewToPeer();
-    }
+    PublishViewToPeer();
 
     // we have seen peer's udp messages get in via UDP. It then publishes to state store that it sees peer at this session
     _logger?.LogDebug("HandshakeStateMachine: Publishing {isA} view to peer {mySessionId} {peerSessionId}", _isA ? "A" : "B", _mySessionId, _peerSessionId);
@@ -263,15 +260,15 @@ class HandshakeStateMachine
                       _internalRecvBuffer[i + 4];
       byte seqNum = _internalRecvBuffer[i + 5];
 
-      _logger?.LogDebug("HandshakeStateMachine: Received UDP bullet packet - Type: {PacketType}, SessionId: {SessionId}, SeqNum: {SeqNum}",
-        packetType, sessionId, seqNum);
-
       if (packetType != 1 || seqNum <= _peerSeq)
       {
         continue;
       }
 
       // new bullet packet. If this says that the session has changed we need to tell the state store that we see B at this session Id now!
+      _logger?.LogDebug("HandshakeStateMachine: Received UDP bullet packet - Type: {PacketType}, SessionId: {SessionId}, SeqNum: {SeqNum}",
+        packetType, sessionId, seqNum);
+
       _peerSessionId = sessionId;
       _peerSeq = seqNum; // update that we see this new sequence number
       gotSomeValidInfo = true;
