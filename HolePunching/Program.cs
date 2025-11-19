@@ -46,7 +46,6 @@ enum ProtocolState : byte
 
 class HandshakeStateMachine
 {
-  private const int MAX_ATTEMPTS = 5;
   private static string STATE_STORE_KEY_PREFIX = "HolePunching:SynAckStateMachine:";
 
   // borrowed socket from HolePunchingStateMachine. DO NOT DISPOSE
@@ -62,8 +61,10 @@ class HandshakeStateMachine
   private readonly byte[] _internalRecvBuffer = new byte[6 * 10]; // 1 byte type + 4 bytes sessionId + 1 byte seq = 6 bytes per packet, buffer should hold a multiple of 6
   private readonly byte[] _internalSendBuffer = new byte[6]; // 1 byte type + 4 bytes sessionId + 1 byte seq
   private readonly bool _isA;
+  private readonly long _timeoutTimeStamp;
 
   // Non-readonly fields
+  private long _startTimeStamp;
   private ProtocolState _currentState = ProtocolState.INITIAL;
   private int _attemptCount = 0;
 
@@ -74,7 +75,7 @@ class HandshakeStateMachine
 
   public ProtocolState CurrentState => _currentState;
 
-  public HandshakeStateMachine(string selfId, string peerId, int sessionId, Socket udpSocket, EndPoint peerEndPoint, ILogger? logger, IConnectionMultiplexer connectionMultiplexer)
+  public HandshakeStateMachine(string selfId, string peerId, int sessionId, Socket udpSocket, EndPoint peerEndPoint, ILogger? logger, IConnectionMultiplexer connectionMultiplexer,TimeSpan timeoutDuration)
   {
     _udpSocket = udpSocket;
     _peerEndPoint = peerEndPoint;
@@ -86,12 +87,16 @@ class HandshakeStateMachine
     // create and store the strings so as to not have to create per calll
     _mySessionStateStoreKey = $"{STATE_STORE_KEY_PREFIX}/{selfId}/{peerId}"; // I can ONLY write to this
     _peerSessionStateStoreKey = $"{STATE_STORE_KEY_PREFIX}/{peerId}/{selfId}"; // I can ONLY read from this. This read write separation means no concurrent write data races can occur
+
+    _timeoutTimeStamp = DateTimeOffset.UtcNow.Add(timeoutDuration).Ticks;
   }
 
   // As long as the state machine is kept active we actually want to keep sending bullets
   public void Next()
   {
-    if (_attemptCount >= MAX_ATTEMPTS)
+    _startTimeStamp = _startTimeStamp == 0 ? DateTimeOffset.UtcNow.Ticks : _startTimeStamp;
+
+    if (_startTimeStamp + _timeoutTimeStamp >= DateTimeOffset.UtcNow.Ticks)
     {
       throw new TimeoutException("Max handshake attempts reached without establishing connection.");
     }
@@ -299,7 +304,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   private readonly string _selfId;
   private readonly int _maxRetryCount;
   private readonly ILogger? _logger;
-
+  private readonly long _timeoutTimeStamp;
 
   // State - Mutable fields 
   private int _registrationRetryCount;
@@ -307,10 +312,11 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   private IPAddress? _peerIp;
   private string? _peerId;
   private int _peerPort;
-  // used to handle synchronization when 2 peers are in 2 different states in the SynAck state machine
-  private int _sessionId;
   internal IPEndPoint? _peerEndPoint;
   private Socket? _udpSocket;
+  // used to handle synchronization when 2 peers are in 2 different states in the SynAck state machine
+  private int _sessionId;
+  private long _startTimeStamp;
 
   // IDisposable support
   private bool _isDisposed;
@@ -332,7 +338,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
     }
   }
 
-  public HolePunchingStateMachine(string selfId, string registrationServerAddr, int maxRetryCount = 60, ILogger? logger = null)
+  public HolePunchingStateMachine(string selfId, string registrationServerAddr, ILogger? logger = null, TimeSpan? timeout = null, int maxRetryCount = 5)
   {
     ArgumentOutOfRangeException.ThrowIfNegative(maxRetryCount);
 
@@ -347,10 +353,19 @@ internal class HolePunchingStateMachine : IAsyncDisposable
     _selfId = selfId;
     _maxRetryCount = maxRetryCount;
     _logger = logger;
+
+    _timeoutTimeStamp = timeout.HasValue ? timeout.Value.Ticks : TimeSpan.FromSeconds(30).Ticks; // default to 30 seconds
+  }
+
+  private bool TimeoutExceeded()
+  {
+    return _startTimeStamp + _timeoutTimeStamp >= DateTimeOffset.UtcNow.Ticks;
   }
 
   public async Task<bool> ConnectAsync(string peerId)
   {
+    _startTimeStamp = _startTimeStamp == 0 ? DateTimeOffset.UtcNow.Ticks : _startTimeStamp;
+  
     if (CurrentState != HolePunchingState.INITIAL)
     {
       throw new InvalidOperationException($"Connection process already started. {CurrentState}");
@@ -429,7 +444,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         Debug.Assert(_peerPort == 0, "Invariant Violation: Will be set once we get peer info from server so currenty should be 0");
         Debug.Assert(_peerEndPoint == null, "Invariant Violation: Will be set once we get peer info from server so currenty should be null");
 
-        if (_registrationRetryCount >= _maxRetryCount)
+        if (TimeoutExceeded())
         {
           // Exceeded max retries, mark as failed
           CurrentState = HolePunchingState.CLOSED;
@@ -468,7 +483,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         Debug.Assert(_peerPort >= 0, "Invariant Violation: Should have been received from server in previous state RegisteredWithServer");
         Debug.Assert(_peerEndPoint != null, "Invariant Violation: Should have been created in previous state RegisteredWithServer");
 
-        if (_handshakeRetryCount >= _maxRetryCount)
+        if (TimeoutExceeded())
         {
           // Exceeded max retries, mark as failed
           CurrentState = HolePunchingState.CLOSED;
@@ -482,7 +497,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
         try
         {
           // Based on role assignemnt create appropriate state machine
-          HandshakeStateMachine stateMachine = new HandshakeStateMachine(_selfId, _peerId, _sessionId, _udpSocket, _peerEndPoint, _logger, _connectionMultiplexer);
+          HandshakeStateMachine stateMachine = new HandshakeStateMachine(_selfId, _peerId, _sessionId, _udpSocket, _peerEndPoint, _logger, _connectionMultiplexer, TimeSpan.FromSeconds(5));
 
           while (stateMachine.CurrentState != ProtocolState.ESTABLISHED_CONNECTION)
           {
