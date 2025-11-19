@@ -159,6 +159,7 @@ class HandshakeStateMachine
         }
       case ProtocolState.ESTABLISHED_CONNECTION:
         // nothing to do here, connection is established
+        // if we are in established connection state, we should drop the bullets
         break;
     }
   }
@@ -179,7 +180,7 @@ class HandshakeStateMachine
     }
 
     IDatabase db = _connectionMultiplexer.GetDatabase();
-    db.Execute("SET", _mySessionStateStoreKey, view);
+    db.Execute("SET", _mySessionStateStoreKey, view, "EX", 30); // expire after 60 seconds to avoid stale state
   }
 
   private bool TryReadPeerView(out int peerSessionId, out int ourSessionIdViewedByPeer)
