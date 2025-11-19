@@ -359,7 +359,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
   {
     _logger?.LogDebug("HolePunching: Checking timeout: StartTimeTicks {StartTimeTicks}, TimeoutDurationTicks {TimeoutDurationTicks}, CurrentTicks {CurrentTicks}",
       _startTimeStampTicks, _timeoutDurationTicks, DateTimeOffset.UtcNow.Ticks);
-    return _startTimeStampTicks + _timeoutDurationTicks > DateTimeOffset.UtcNow.Ticks;
+    return DateTimeOffset.UtcNow.Ticks >= _startTimeStampTicks + _timeoutDurationTicks;
   }
 
   public async Task<bool> ConnectAsync(string peerId)
