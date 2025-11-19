@@ -92,21 +92,19 @@ class HandshakeStateMachine
   // As long as the state machine is kept active we actually want to keep sending bullets
   public void Next()
   {
+    PublishViewToPeer();
     // UDP is only kept for hole punching keep-alive bullets, only once the established state is reached should UDP be used for actual data transfer
     ShootNatPenetrationBullets(2); // 3 bullets per state call to keep NAT mappings alive
     bool gotNewPeerBullets = TryReadNatPenetrationBullets();
-  
-    // read penetration bullets that could have been sent by peer
+    // read penetration bullets that could have been sent by peer. This will be used to make sure
     bool readPeerView = TryReadPeerView(out int peerSessionId, out int ourSessionIdViewedByPeer);
-  
-    _logger?.LogDebug("HandshakeStateMachine: Read peer view from state store PeerSessionId: {PeerSessionId}, {PeersViewOfOurSessionId}",
-      peerSessionId, ourSessionIdViewedByPeer);
-  
+
     // we have seen peer's udp messages get in via UDP. It then publishes to state store that it sees peer at this session
     _logger?.LogDebug("HandshakeStateMachine: Publishing {isA} view to peer {mySessionId} {peerSessionId}", _isA ? "A" : "B", _mySessionId, _peerSessionId);
-    PublishViewToPeer();
 
 
+    _logger?.LogDebug("HandshakeStateMachine: Read peer view from state store PeerSessionId: {PeerSessionId}, {PeersViewOfOurSessionId}",
+      peerSessionId, ourSessionIdViewedByPeer);
 
     switch (_currentState)
     {
