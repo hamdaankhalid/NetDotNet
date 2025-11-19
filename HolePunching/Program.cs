@@ -506,7 +506,7 @@ internal class HolePunchingStateMachine : IAsyncDisposable
           while (stateMachine.CurrentState != ProtocolState.ESTABLISHED_CONNECTION)
           {
             stateMachine.Next();
-            await Task.Delay(Random.Shared.Next(20, 80)); // small delay to avoid tight loop
+            await Task.Delay(Random.Shared.Next(500, 150)); // small delay to avoid tight loop
           }
           connected = true;
         }
