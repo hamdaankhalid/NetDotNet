@@ -92,17 +92,21 @@ class HandshakeStateMachine
   // As long as the state machine is kept active we actually want to keep sending bullets
   public void Next()
   {
-    // state machines should use the backing store for reliable delivery of state messages not UDP
     // UDP is only kept for hole punching keep-alive bullets, only once the established state is reached should UDP be used for actual data transfer
-    ShootNatPenetrationBullets(1); // 3 bullets per state call to keep NAT mappings alive
+    ShootNatPenetrationBullets(2); // 3 bullets per state call to keep NAT mappings alive
+    bool gotNewPeerBullets = TryReadNatPenetrationBullets();
+  
     // read penetration bullets that could have been sent by peer
-    bool gotPeerBullets = TryReadNatPenetrationBullets();
-    PublishViewToPeer();
-
+    bool readPeerView = TryReadPeerView(out int peerSessionId, out int ourSessionIdViewedByPeer);
+  
+    _logger?.LogDebug("HandshakeStateMachine: Read peer view from state store PeerSessionId: {PeerSessionId}, {PeersViewOfOurSessionId}",
+      peerSessionId, ourSessionIdViewedByPeer);
+  
     // we have seen peer's udp messages get in via UDP. It then publishes to state store that it sees peer at this session
     _logger?.LogDebug("HandshakeStateMachine: Publishing {isA} view to peer {mySessionId} {peerSessionId}", _isA ? "A" : "B", _mySessionId, _peerSessionId);
+    PublishViewToPeer();
 
-    bool readPeerView = TryReadPeerView(out int peerSessionId, out int ourSessionIdViewedByPeer);
+
 
     switch (_currentState)
     {
@@ -113,7 +117,7 @@ class HandshakeStateMachine
             throw new TimeoutException("Max retries reached");
           }
 
-          if (!gotPeerBullets)
+          if (!gotNewPeerBullets)
           {
             _logger?.LogDebug("HandshakeStateMachine: No valid UDP bullets received from peer");
             // have not yet seen any peer state
@@ -129,10 +133,8 @@ class HandshakeStateMachine
         {
           // if the recvd bullets are from the same session who has posted state, that same session must be live right now, and if the live session can confirm that it sees us!
           // we can establish that a bidirectionally viewable UDP channel has been established.
-          if (gotPeerBullets && readPeerView)
+          if (gotNewPeerBullets && readPeerView)
           {
-            _logger?.LogDebug("HandshakeStateMachine: Read peer view from state store PeerSessionId: {PeerSessionId}, {PeersViewOfOurSessionId}",
-              peerSessionId, ourSessionIdViewedByPeer);
 
             if (peerSessionId == _peerSessionId && ourSessionIdViewedByPeer == _mySessionId)
             {
@@ -143,12 +145,12 @@ class HandshakeStateMachine
             {
               _logger?.LogDebug(
                 "HandshakeStateMachine: PeerSessionId: {PeerSessionId}, OurViewOfPeerSession: {OurViewOfPeerSession}, PeerViewOfOurSeesionId: {PeerViewOfOurSeesionId} OurSessionId: {OurSessionId}",
-                  peerSessionId, ourSessionIdViewedByPeer, ourSessionIdViewedByPeer,_mySessionId);
+                  peerSessionId, ourSessionIdViewedByPeer, ourSessionIdViewedByPeer, _mySessionId);
             }
           }
-          else 
+          else
           {
-            _logger?.LogDebug("HandshakeStateMachine: {reason}", gotPeerBullets ? "Failed to read peer view from state store" : "No valid UDP bullets received from peer");
+            _logger?.LogDebug("HandshakeStateMachine: {reason}", gotNewPeerBullets ? "Failed to read peer view from state store" : "No valid UDP bullets received from peer");
           }
 
           _attemptCount++;
